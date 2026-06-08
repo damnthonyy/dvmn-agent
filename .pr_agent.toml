@@ -18,3 +18,8 @@ push_commands = [
 [review_agent]
 enabled = true
 publish_output = true
+
+
+[openai]
+api_base = "http://localhost:8787/v1" ## proxy for headroom token compressor ( https://github.com/chopratejas/headroom )
+key = "sk-xxxxxx"
