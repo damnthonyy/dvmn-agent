@@ -7,6 +7,7 @@ from typing import Any, Dict, Tuple
 
 import uvicorn
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
+from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTasks
 from starlette.middleware import Middleware
 from starlette_context import context
@@ -22,6 +23,7 @@ from pr_agent.git_providers.utils import apply_repo_settings
 from pr_agent.identity_providers import get_identity_provider
 from pr_agent.identity_providers.identity_provider import Eligibility
 from pr_agent.log import LoggingFormat, get_logger, setup_logger
+from pr_agent.servers.dashboard import router as dashboard_router
 from pr_agent.servers.utils import DefaultDictWithTimeout, verify_signature
 
 setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
@@ -427,6 +429,8 @@ if get_settings().github_app.override_deployment_type:
 middleware = [Middleware(RawContextMiddleware)]
 app = FastAPI(middleware=middleware)
 app.include_router(router)
+app.include_router(dashboard_router)
+app.mount("/public", StaticFiles(directory=os.path.join(os.path.dirname(base_path), "public")), name="public")
 
 
 def start():

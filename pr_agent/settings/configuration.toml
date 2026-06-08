@@ -225,6 +225,9 @@ try_fix_invalid_inline_comments = true
 app_name = "dvmn-agent"
 ignore_bot_pr = true
 
+[dashboard]
+access_token = ""   # if non-empty, the /dashboard page requires this token via ?token= or the X-Dashboard-Token header
+
 [github_action_config]
 # auto_review = true    # set as env var in .github/workflows/dvmn-agent.yaml
 # auto_describe = true  # set as env var in .github/workflows/dvmn-agent.yaml
