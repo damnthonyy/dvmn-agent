@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>dvmn-agent — Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:       #0d1117;
+      --sidebar:  #171717;
+      --card:     #161b22;
+      --border:   #21262d;
+      --border-s: #262626;
+      --text:     #fafafa;
+      --muted:    #a1a1a1;
+      --link:     #58a6ff;
+      --green:    #3fb950;
+      --font: 'Inter', system-ui, sans-serif;
+    }
+    body { background:var(--bg); color:var(--text); font-family:var(--font); font-size:14px; display:flex; min-height:100vh; }
+
+    /* ── Sidebar ──────────────────────────────────── */
+    .sidebar {
+      width:256px; min-height:100vh; background:var(--sidebar);
+      border-right:1px solid var(--border-s);
+      display:flex; flex-direction:column; flex-shrink:0;
+      position:sticky; top:0; height:100vh;
+    }
+    .sidebar-logo { display:flex; align-items:center; gap:8px; padding:16px; height:64px; }
+    .sidebar-logo-text { font-size:18px; font-weight:600; letter-spacing:-.44px; }
+    .sidebar-nav { flex:1; padding:8px; display:flex; flex-direction:column; gap:4px; }
+    .nav-item {
+      display:flex; align-items:center; gap:8px; padding:8px; border-radius:8px;
+      font-size:14px; font-weight:500; color:var(--text); text-decoration:none;
+    }
+    .nav-item.active { background:#262626; }
+    .nav-item.disabled { opacity:.5; cursor:default; }
+    .sidebar-footer {
+      padding:16px; display:flex; align-items:center; justify-content:space-between;
+      border-top:1px solid var(--border-s);
+    }
+    .sidebar-footer-label { color:var(--muted); }
+    .status-dot-row { display:flex; align-items:center; gap:6px; font-weight:500; }
+    .status-dot { width:8px; height:8px; border-radius:50%; background:var(--green); flex-shrink:0; }
+
+    /* ── Main ─────────────────────────────────────── */
+    .main { flex:1; min-width:0; display:flex; flex-direction:column; }
+
+    /* ── Header ───────────────────────────────────── */
+    .dash-header {
+      display:flex; align-items:center; justify-content:space-between;
+      padding:16px 24px 17px; border-bottom:1px solid var(--border);
+      position:sticky; top:0; background:var(--bg); z-index:10;
+    }
+    .header-left { display:flex; align-items:center; gap:16px; }
+    .header-title { font-size:20px; font-weight:600; letter-spacing:-.45px; }
+
+    /* Repo dropdown */
+    .repo-dropdown { position:relative; }
+    .dropdown-trigger {
+      display:flex; align-items:center; justify-content:space-between; gap:10px;
+      background:rgba(38,38,38,.3); border:1px solid var(--border); border-radius:8px;
+      padding:7px 13px; cursor:pointer; min-width:240px; user-select:none;
+    }
+    .dropdown-trigger:hover { background:rgba(38,38,38,.6); }
+    .dropdown-trigger-text { display:flex; align-items:center; gap:8px; overflow:hidden; }
+    .dropdown-trigger-name { font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:160px; }
+    .dropdown-trigger-count { color:var(--muted); font-size:12px; white-space:nowrap; }
+    .dropdown-chevron { flex-shrink:0; transition:transform .15s; }
+    .dropdown-chevron.open { transform:rotate(180deg); }
+
+    .dropdown-menu {
+      display:none; position:absolute; top:calc(100% + 6px); left:0;
+      background:#1c2128; border:1px solid var(--border); border-radius:8px;
+      min-width:100%; max-height:320px; overflow-y:auto; z-index:100;
+      box-shadow:0 8px 24px rgba(0,0,0,.5);
+    }
+    .dropdown-menu.open { display:block; }
+    .dropdown-item {
+      display:flex; align-items:center; justify-content:space-between;
+      padding:9px 13px; cursor:pointer; gap:12px;
+    }
+    .dropdown-item:hover { background:rgba(255,255,255,.06); }
+    .dropdown-item.selected { background:rgba(88,166,255,.1); }
+    .dropdown-item-name { font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .dropdown-item-count {
+      font-size:12px; color:var(--link); background:rgba(88,166,255,.15);
+      border-radius:6px; padding:1px 7px; white-space:nowrap; flex-shrink:0;
+    }
+
+    .header-right { display:flex; align-items:center; gap:12px; }
+    .last-updated { color:var(--muted); white-space:nowrap; font-size:13px; }
+    .btn-refresh {
+      display:flex; align-items:center; gap:8px; padding:6px 10px; border-radius:8px;
+      background:transparent; border:none; color:var(--text);
+      font-family:var(--font); font-size:14px; font-weight:500; cursor:pointer;
+      text-decoration:none;
+    }
+    .btn-refresh:hover { background:rgba(255,255,255,.06); }
+
+    /* ── Content ──────────────────────────────────── */
+    .content { padding:24px; }
+
+    /* Repo title row */
+    .repo-title-row { margin-bottom:4px; }
+    .repo-name { font-size:18px; font-weight:600; letter-spacing:-.44px; color:var(--text); text-decoration:none; }
+    .repo-name:hover { text-decoration:underline; }
+    .repo-desc { color:var(--muted); margin-top:4px; font-size:14px; }
+
+    /* Stats */
+    .stats-row { display:flex; gap:12px; flex-wrap:wrap; margin:16px 0; }
+    .stat-card {
+      background:var(--card); border:1px solid var(--border);
+      border-radius:14px; padding:16px 16px 24px; min-width:110px;
+    }
+    .stat-label { display:flex; align-items:center; gap:6px; color:var(--muted); font-size:13px; margin-bottom:6px; }
+    .stat-value { font-size:24px; font-weight:600; line-height:1; }
+    .stat-value.col-default { color:var(--text); }
+    .stat-value.col-blue    { color:#51a2ff; }
+    .stat-value.col-green   { color:#05df72; }
+    .stat-value.col-orange  { color:#e3b341; }
+
+    /* PR table */
+    .pr-section-title { font-size:18px; font-weight:600; letter-spacing:-.44px; margin-bottom:12px; }
+    .pr-table-wrap { border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+    table { width:100%; border-collapse:collapse; }
+    thead tr { border-bottom:1px solid var(--border); }
+    th { padding:10px 10px; text-align:left; font-size:13px; font-weight:500; white-space:nowrap; }
+    tbody tr:nth-child(odd)  { background:rgba(255,255,255,.02); }
+    tbody tr:nth-child(even) { background:rgba(255,255,255,.04); }
+    tbody tr:last-child td   { border-bottom:none; }
+    td { padding:9px 10px; border-bottom:1px solid var(--border); font-size:14px; vertical-align:middle; }
+    .col-num { width:52px; color:var(--muted); font-family:'Menlo','Monaco',monospace; white-space:nowrap; }
+    .col-title a { color:var(--link); text-decoration:none; }
+    .col-title a:hover { text-decoration:underline; }
+    .col-author { width:130px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .col-date   { width:90px; color:var(--muted); white-space:nowrap; }
+    .col-status { width:110px; white-space:nowrap; }
+
+    /* Badges */
+    .badge {
+      display:inline-flex; align-items:center; justify-content:center;
+      padding:2px 9px; border-radius:8px; font-size:12px; font-weight:500; border:1px solid;
+    }
+    .badge-pending  { background:rgba(106,114,130,.2); border-color:rgba(106,114,130,.3); color:#d1d5dc; }
+    .badge-described{ background:rgba(81,162,255,.2);  border-color:rgba(81,162,255,.3);  color:#93c5fd; }
+    .badge-reviewed { background:rgba(173,70,255,.2);  border-color:rgba(173,70,255,.3);  color:#dab2ff; }
+    .badge-improved { background:rgba(0,201,80,.2);    border-color:rgba(0,201,80,.3);    color:#7bf1a8; }
+
+    /* Empty states */
+    .empty      { padding:18px 10px; color:var(--muted); font-style:italic; }
+    .empty-page { display:flex; flex-direction:column; align-items:center; gap:12px; padding:80px 24px; color:var(--muted); text-align:center; }
+    .empty-page svg { opacity:.35; }
+
+    /* Repo views — only the active one is shown */
+    .repo-view { display:none; }
+    .repo-view.active { display:block; }
+
+    @media (max-width:768px) {
+      .sidebar { display:none; }
+      .stats-row .stat-card { min-width:90px; }
+      .dropdown-trigger { min-width:180px; }
+      .col-author, .col-date { display:none; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- Sidebar -->
+<aside class="sidebar">
+  <div class="sidebar-logo">
+    <img src="../../../public/images/picmecarton.png" alt="logo" width="32" height="32">
+    <span class="sidebar-logo-text">dvmn-agent</span>
+  </div>
+  <nav class="sidebar-nav">
+    <a class="nav-item active" href="/dashboard">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+      Dashboard
+    </a>
+    <span class="nav-item disabled">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/></svg>
+      Settings
+    </span>
+  </nav>
+  <div class="sidebar-footer">
+    <span class="sidebar-footer-label">GitHub App</span>
+    <div class="status-dot-row">
+      <div class="status-dot"></div>
+      <span>Connected</span>
+    </div>
+  </div>
+</aside>
+
+<!-- Main -->
+<main class="main">
+
+  <!-- Header -->
+  <header class="dash-header">
+    <div class="header-left">
+      <h1 class="header-title">Repository</h1>
+
+      {% if repos %}
+      <div class="repo-dropdown" id="repoDropdown">
+        <div class="dropdown-trigger" id="dropdownTrigger" onclick="toggleDropdown()">
+          <div class="dropdown-trigger-text">
+            <span class="dropdown-trigger-name" id="triggerName">{{ repos[0].repo_full_name.split('/')[1] }}</span>
+            <span class="dropdown-trigger-count" id="triggerCount">({{ repos[0].pulls|length }} open)</span>
+          </div>
+          <svg class="dropdown-chevron" id="dropdownChevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+        </div>
+        <div class="dropdown-menu" id="dropdownMenu">
+          {% for repo in repos %}
+          <div class="dropdown-item {% if loop.first %}selected{% endif %}"
+               id="item-{{ loop.index0 }}"
+               data-index="{{ loop.index0 }}"
+               data-name="{{ repo.repo_full_name.split('/')[1] }}"
+               data-count="{{ repo.pulls|length }}">
+            <span class="dropdown-item-name">{{ repo.repo_full_name }}</span>
+            {% if repo.pulls|length > 0 %}
+            <span class="dropdown-item-count">{{ repo.pulls|length }} open</span>
+            {% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+    </div>
+
+    <div class="header-right">
+      <span class="last-updated" id="lastUpdated">Updated less than a minute ago</span>
+      <a class="btn-refresh" href="/dashboard">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        Refresh
+      </a>
+    </div>
+  </header>
+
+  <!-- Content -->
+  <div class="content">
+    {% if not repos %}
+    <div class="empty-page">
+      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3h6l2 2h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/></svg>
+      <p>No repositories found where the GitHub App is installed.</p>
+    </div>
+    {% endif %}
+
+    {% for repo in repos %}
+    <div class="repo-view {% if loop.first %}active{% endif %}" id="repo-{{ loop.index0 }}">
+
+      <!-- Repo name + description -->
+      <div class="repo-title-row">
+        <a class="repo-name" href="{{ repo.repo_url }}" target="_blank" rel="noopener">{{ repo.repo_full_name }}</a>
+        {% if repo.description %}
+        <p class="repo-desc">{{ repo.description }}</p>
+        {% endif %}
+      </div>
+
+      <!-- Stats cards -->
+      <div class="stats-row">
+        <div class="stat-card">
+          <div class="stat-label">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+            Stars
+          </div>
+          <div class="stat-value col-default">{{ repo.stars }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
+            Forks
+          </div>
+          <div class="stat-value col-default">{{ repo.forks }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7"/><line x1="6" y1="9" x2="6" y2="21"/></svg>
+            Open
+          </div>
+          <div class="stat-value col-blue">{{ repo.pulls|length }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="9 12 11 14 15 10"/></svg>
+            Closed
+          </div>
+          <div class="stat-value col-green">{{ repo.closed_prs }}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            Updated
+          </div>
+          <div class="stat-value col-default" style="font-size:14px;font-weight:500;padding-top:4px;">{{ repo.updated_at }}</div>
+        </div>
+      </div>
+
+      <!-- PR table -->
+      <p class="pr-section-title">Pull Requests</p>
+      {% if repo.pulls %}
+      <div class="pr-table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Title</th>
+              <th class="col-author">Author</th>
+              <th class="col-date">Date</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for pr in repo.pulls %}
+            <tr>
+              <td class="col-num">#{{ pr.number }}</td>
+              <td class="col-title"><a href="{{ pr.html_url }}" target="_blank" rel="noopener">{{ pr.title }}</a></td>
+              <td class="col-author">{{ pr.author }}</td>
+              <td class="col-date">{{ pr.created_at[:10] if pr.created_at else '—' }}</td>
+              <td class="col-status">
+                {% set s = pr.status %}
+                {% if s == 'improved' %}
+                  <span class="badge badge-improved">Improved</span>
+                {% elif s == 'reviewed' %}
+                  <span class="badge badge-reviewed">Reviewed</span>
+                {% elif s == 'described' %}
+                  <span class="badge badge-described">Described</span>
+                {% else %}
+                  <span class="badge badge-pending">Pending</span>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+        <p class="empty">No open pull requests.</p>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</main>
+
+<script>
+  // ── Dropdown ─────────────────────────────────────
+  let currentIndex = 0;
+
+  function toggleDropdown() {
+    const menu    = document.getElementById('dropdownMenu');
+    const chevron = document.getElementById('dropdownChevron');
+    const open    = menu.classList.toggle('open');
+    chevron.classList.toggle('open', open);
+  }
+
+  function selectRepo(index, shortName, openCount) {
+    document.getElementById('triggerName').textContent  = shortName;
+    document.getElementById('triggerCount').textContent = `(${openCount} open)`;
+
+    document.getElementById(`item-${currentIndex}`).classList.remove('selected');
+    document.getElementById(`item-${index}`).classList.add('selected');
+    currentIndex = index;
+
+    document.querySelectorAll('.repo-view').forEach(el => el.classList.remove('active'));
+    document.getElementById(`repo-${index}`).classList.add('active');
+
+    document.getElementById('dropdownMenu').classList.remove('open');
+    document.getElementById('dropdownChevron').classList.remove('open');
+  }
+
+  document.querySelectorAll('.dropdown-item').forEach(item => {
+    item.addEventListener('click', () => {
+      selectRepo(
+        parseInt(item.dataset.index, 10),
+        item.dataset.name,
+        parseInt(item.dataset.count, 10)
+      );
+    });
+  });
+
+  // Close dropdown on outside click
+  document.addEventListener('click', e => {
+    if (!document.getElementById('repoDropdown')?.contains(e.target)) {
+      document.getElementById('dropdownMenu')?.classList.remove('open');
+      document.getElementById('dropdownChevron')?.classList.remove('open');
+    }
+  });
+
+  // ── Last-updated ticker ───────────────────────────
+  const loadedAt = Date.now();
+  const el = document.getElementById('lastUpdated');
+  setInterval(() => {
+    const s = Math.floor((Date.now() - loadedAt) / 1000);
+    el.textContent = s < 60 ? 'Updated less than a minute ago' : `Updated ${Math.floor(s / 60)}m ago`;
+  }, 30000);
+</script>
+
+</body>
+</html>
