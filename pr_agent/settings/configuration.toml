@@ -147,6 +147,8 @@ suggestions_score_threshold=0 # [0-10]| recommend not to set this value above 8,
 new_score_mechanism=true
 new_score_mechanism_th_high=9
 new_score_mechanism_th_medium=7
+show_scores=true # show score column in suggestions table
+max_suggestions_displayed=10 # max number of suggestions to display in the table
 # params for '/improve --extended' mode
 auto_extended_mode=true
 num_code_suggestions_per_chunk=3

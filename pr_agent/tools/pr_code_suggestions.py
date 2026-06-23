@@ -789,26 +789,43 @@ class PRCodeSuggestions:
                 for ext in extensions:
                     extension_to_language[ext] = language
 
-            pr_body += "<table>"
-            header = f"Suggestion"
-            delta = 66
-            header += "&nbsp; " * delta
-            pr_body += f"""<thead><tr><td><strong>Category</strong></td><td align=left><strong>{header}</strong></td><td align=center><strong>Impact</strong></td></tr>"""
-            pr_body += """<tbody>"""
-            suggestions_labels = dict()
-            # add all suggestions related to each label
+            show_scores = get_settings().pr_code_suggestions.get('show_scores', True)
+            max_displayed = get_settings().pr_code_suggestions.get('max_suggestions_displayed', 10)
+
+            # Flatten all suggestions and sort by score descending
+            all_suggestions = []
             for suggestion in data['code_suggestions']:
                 label = suggestion['label'].strip().strip("'").strip('"')
+                suggestion['_label'] = label
+                all_suggestions.append(suggestion)
+            all_suggestions.sort(key=lambda x: int(x.get('score', 0)), reverse=True)
+
+            # Cap the number of displayed suggestions
+            if max_displayed > 0:
+                all_suggestions = all_suggestions[:max_displayed]
+
+            # Re-group by label while preserving score order
+            suggestions_labels = dict()
+            for suggestion in all_suggestions:
+                label = suggestion['_label']
                 if label not in suggestions_labels:
                     suggestions_labels[label] = []
                 suggestions_labels[label].append(suggestion)
 
-            # sort suggestions_labels by the suggestion with the highest score
+            # Sort label groups by the highest score in each group
             suggestions_labels = dict(
-                sorted(suggestions_labels.items(), key=lambda x: max([s['score'] for s in x[1]]), reverse=True))
-            # sort the suggestions inside each label group by score
-            for label, suggestions in suggestions_labels.items():
-                suggestions_labels[label] = sorted(suggestions, key=lambda x: x['score'], reverse=True)
+                sorted(suggestions_labels.items(), key=lambda x: max([int(s.get('score', 0)) for s in x[1]]), reverse=True))
+
+            # Build table header
+            pr_body += "<table>"
+            header = f"Suggestion"
+            delta = 66
+            header += "&nbsp; " * delta
+            if show_scores:
+                pr_body += f"""<thead><tr><td><strong>Category</strong></td><td align=left><strong>{header}</strong></td><td align=center><strong>Score</strong></td><td align=center><strong>Impact</strong></td></tr>"""
+            else:
+                pr_body += f"""<thead><tr><td><strong>Category</strong></td><td align=left><strong>{header}</strong></td><td align=center><strong>Impact</strong></td></tr>"""
+            pr_body += """<tbody>"""
 
             counter_suggestions = 0
             for label, suggestions in suggestions_labels.items():
@@ -828,14 +845,12 @@ class PRCodeSuggestions:
                     try:
                         code_snippet_link = self.git_provider.get_line_link(relevant_file, relevant_lines_start,
                                                                             relevant_lines_end)
-                    except:
+                    except Exception:
                         code_snippet_link = ""
-                    # add html table for each suggestion
 
                     suggestion_content = suggestion['suggestion_content'].rstrip()
                     CHAR_LIMIT_PER_LINE = 84
                     suggestion_content = insert_br_after_x_chars(suggestion_content, CHAR_LIMIT_PER_LINE)
-                    # pr_body += f"<tr><td><details><summary>{suggestion_content}</summary>"
                     existing_code = suggestion['existing_code'].rstrip() + "\n"
                     improved_code = suggestion['improved_code'].rstrip() + "\n"
 
@@ -844,15 +859,13 @@ class PRCodeSuggestions:
                     patch_orig = "\n".join(diff)
                     patch = "\n".join(patch_orig.splitlines()[5:]).strip('\n')
 
-                    example_code = ""
-                    example_code += f"```diff\n{patch.rstrip()}\n```\n"
+                    example_code = f"```diff\n{patch.rstrip()}\n```\n"
                     if i == 0:
                         pr_body += f"""<td>\n\n"""
                     else:
                         pr_body += f"""<tr><td>\n\n"""
                     suggestion_summary = suggestion['one_sentence_summary'].strip().rstrip('.')
                     if "'<" in suggestion_summary and ">'" in suggestion_summary:
-                        # escape the '<' and '>' characters, otherwise they are interpreted as html tags
                         get_logger().info(f"Escaped suggestion summary: {suggestion_summary}")
                         suggestion_summary = suggestion_summary.replace("'<", "`<")
                         suggestion_summary = suggestion_summary.replace(">'", ">`")
@@ -874,23 +887,34 @@ class PRCodeSuggestions:
 
                     pr_body += f"</details>"
 
-                    # # add another column for 'score'
+                    # Score column (visible when show_scores=true)
                     score_int = int(suggestion.get('score', 0))
-                    score_str = f"{score_int}"
-                    if get_settings().pr_code_suggestions.new_score_mechanism:
-                        score_str = self.get_score_str(score_int)
-                    pr_body += f"</td><td align=center>{score_str}\n\n"
+                    if show_scores:
+                        pr_body += f"</td><td align=center><strong>{score_int}</strong>/10\n\n"
+
+                    # Impact badge column
+                    impact_str = self.get_impact_badge(score_int)
+                    pr_body += f"</td><td align=center>{impact_str}\n\n"
 
                     pr_body += f"</td></tr>"
                     counter_suggestions += 1
 
-                # pr_body += "</details>"
-                # pr_body += """</td></tr>"""
             pr_body += """</tr></tbody></table>"""
             return pr_body
         except Exception as e:
             get_logger().info(f"Failed to publish summarized code suggestions, error: {e}")
             return ""
+
+    def get_impact_badge(self, score: int) -> str:
+        """Return a colored impact badge based on the score."""
+        th_high = get_settings().pr_code_suggestions.get('new_score_mechanism_th_high', 9)
+        th_medium = get_settings().pr_code_suggestions.get('new_score_mechanism_th_medium', 7)
+        if score >= th_high:
+            return "🔴 High"
+        elif score >= th_medium:
+            return "🟡 Medium"
+        else:
+            return "🟢 Low"
 
     def get_score_str(self, score: int) -> str:
         th_high = get_settings().pr_code_suggestions.get('new_score_mechanism_th_high', 9)
@@ -899,7 +923,7 @@ class PRCodeSuggestions:
             return "High"
         elif score >= th_medium:
             return "Medium"
-        else:  # score < 7
+        else:
             return "Low"
 
     async def self_reflect_on_suggestions(self,
