@@ -96,6 +96,7 @@ minimal_commits_for_incremental_review=0
 minimal_minutes_for_incremental_review=0
 enable_intro_text=true
 enable_help_text=false # Determines whether to include help text in the PR review. Enabled by default.
+compact_mode=true # when true, uses collapsible sections with a top-level summary card
 
 [pr_description] # /describe #
 publish_labels=false
