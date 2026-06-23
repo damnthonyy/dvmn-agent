@@ -75,6 +75,7 @@ class PRDescription:
             "include_file_summary_changes": len(self.git_provider.get_diff_files()) <= self.COLLAPSIBLE_FILE_LIST_THRESHOLD,
             "duplicate_prompt_examples": get_settings().config.get("duplicate_prompt_examples", False),
             "enable_pr_diagram": enable_pr_diagram,
+            "enforce_template": get_settings().pr_description.get("enforce_template", True),
         }
 
         self.user_description = self.git_provider.get_user_description()
@@ -466,6 +467,8 @@ class PRDescription:
                 self.data['changes_diagram'] = sanitized
         if 'pr_files' in self.data:
             self.data['pr_files'] = self.data.pop('pr_files')
+        if 'notes_for_reviewer' in self.data:
+            self.data['notes_for_reviewer'] = self.data.pop('notes_for_reviewer')
 
     def _prepare_labels(self) -> List[str]:
         pr_labels = []
@@ -559,19 +562,85 @@ class PRDescription:
         if 'labels' in self.data and self.git_provider.is_supported("get_labels"):
             self.data.pop('labels')
         if not get_settings().pr_description.enable_pr_type:
-            self.data.pop('type')
+            self.data.pop('type', None)
 
         # Remove the 'PR Title' key from the dictionary
         ai_title = self.data.pop('title', self.vars["title"])
         if (not get_settings().pr_description.generate_ai_title):
-            # Assign the original PR title to the 'title' variable
             title = self.vars["title"]
         else:
-            # Assign the value of the 'PR Title' key to 'title' variable
             title = ai_title
 
-        # Iterate over the remaining dictionary items and append the key and value to 'pr_body' in a markdown format,
-        # except for the items containing the word 'walkthrough'
+        enforce_template = get_settings().pr_description.get("enforce_template", True)
+
+        if enforce_template:
+            return self._prepare_pr_answer_enforced_template(title)
+        else:
+            return self._prepare_pr_answer_classic(title)
+
+    def _prepare_pr_answer_enforced_template(self, title: str) -> Tuple[str, str, str, List[dict]]:
+        """
+        Render PR description with a fixed section order:
+        1. PR Type
+        2. Summary
+        3. What Changed (file walkthrough table)
+        4. Diagram (conditional: only if >= diagram_min_files files changed)
+        5. Notes for Reviewer
+        """
+        pr_body = ""
+        changes_walkthrough = ""
+        pr_file_changes = []
+
+        # --- 1. PR Type ---
+        pr_type = self.data.get('type', 'N/A')
+        if isinstance(pr_type, list):
+            pr_type = ', '.join(v.rstrip() for v in pr_type)
+        pr_body += f"### **PR Type**\n{pr_type}\n"
+
+        pr_body += "\n\n___\n\n"
+
+        # --- 2. Summary ---
+        description = self.data.get('description', 'N/A')
+        if isinstance(description, list):
+            description = ', '.join(v.rstrip() for v in description)
+        description = description.replace('\n-', '\n\n-').strip()
+        pr_body += f"### **Summary**\n{description}\n"
+
+        pr_body += "\n\n___\n\n"
+
+        # --- 3. What Changed (file walkthrough) ---
+        if get_settings().pr_description.enable_semantic_files_types and self.file_label_dict:
+            changes_walkthrough_table, pr_file_changes = self.process_pr_files_prediction("", self.file_label_dict)
+            if get_settings().pr_description.get('file_table_collapsible_open_by_default', False):
+                initial_status = " open"
+            else:
+                initial_status = ""
+            changes_walkthrough = f"<details{initial_status}> <summary><h3> {PRDescriptionHeader.FILE_WALKTHROUGH.value}</h3></summary>\n\n"
+            changes_walkthrough += f"{changes_walkthrough_table}\n\n"
+            changes_walkthrough += "</details>\n\n"
+
+        # --- 4. Diagram (conditional) ---
+        diagram_min_files = get_settings().pr_description.get("diagram_min_files", 3)
+        num_changed_files = len(self.git_provider.get_diff_files())
+        changes_diagram = self.data.get('changes_diagram', '')
+        if changes_diagram and num_changed_files >= diagram_min_files:
+            pr_body += f"### {PRDescriptionHeader.DIAGRAM_WALKTHROUGH.value}\n\n"
+            pr_body += f"{changes_diagram}\n\n"
+            pr_body += "\n\n___\n\n"
+
+        # --- 5. Notes for Reviewer ---
+        notes = self.data.get('notes_for_reviewer', 'N/A')
+        if isinstance(notes, list):
+            notes = ', '.join(v.rstrip() for v in notes)
+        notes = notes.strip()
+        pr_body += f"### **Notes for Reviewer**\n{notes}\n"
+
+        return title, pr_body, changes_walkthrough, pr_file_changes
+
+    def _prepare_pr_answer_classic(self, title: str) -> Tuple[str, str, str, List[dict]]:
+        """
+        Classic PR description rendering (original behavior when enforce_template=false).
+        """
         pr_body, changes_walkthrough = "", ""
         pr_file_changes = []
         for idx, (key, value) in enumerate(self.data.items()):
@@ -585,8 +654,6 @@ class PRDescription:
                 key_publish = key.rstrip(':').replace("_", " ").capitalize()
                 if key_publish == "Type":
                     key_publish = "PR Type"
-                # elif key_publish == "Description":
-                #     key_publish = "PR Description"
                 pr_body += f"### **{key_publish}**\n"
             if 'walkthrough' in key.lower():
                 if self.git_provider.is_supported("gfm_markdown"):
@@ -597,7 +664,7 @@ class PRDescription:
                     pr_body += f'- `{filename}`: {description}\n'
                 if self.git_provider.is_supported("gfm_markdown"):
                     pr_body += "</details>\n"
-            elif 'pr_files' in key.lower() and get_settings().pr_description.enable_semantic_files_types: # 'File Walkthrough' section
+            elif 'pr_files' in key.lower() and get_settings().pr_description.enable_semantic_files_types:
                 changes_walkthrough_table, pr_file_changes = self.process_pr_files_prediction(changes_walkthrough, value)
                 if get_settings().pr_description.get('file_table_collapsible_open_by_default', False):
                     initial_status = " open"
@@ -609,17 +676,16 @@ class PRDescription:
             elif key.lower().strip() == 'description':
                 if isinstance(value, list):
                     value = ', '.join(v.rstrip() for v in value)
-                value = value.replace('\n-', '\n\n-').strip() # makes the bullet points more readable by adding double space
+                value = value.replace('\n-', '\n\n-').strip()
                 pr_body += f"{value}\n"
             else:
-                # if the value is a list, join its items by comma
                 if isinstance(value, list):
                     value = ', '.join(v.rstrip() for v in value)
                 pr_body += f"{value}\n"
             if idx < len(self.data) - 1:
                 pr_body += "\n\n___\n\n"
 
-        return title, pr_body, changes_walkthrough, pr_file_changes,
+        return title, pr_body, changes_walkthrough, pr_file_changes
 
     def _prepare_file_labels(self):
         file_label_dict = {}
