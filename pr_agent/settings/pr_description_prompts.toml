@@ -53,6 +53,9 @@ class PRDescription(BaseModel):
 {%- if enable_semantic_files_types %}
     pr_files: List[FileDescription] = Field(max_items=20, description="a list of all the files that were changed in the PR, and summary of their changes. Each file must be analyzed regardless of change size.")
 {%- endif %}
+{%- if enforce_template %}
+    notes_for_reviewer: str = Field(description="important notes, caveats, or areas that need special attention from the reviewer. Write 'N/A' if there are no special notes.")
+{%- endif %}
 =====
 
 
@@ -87,6 +90,10 @@ pr_files:
   label: |
     label_key_1
 ...
+{%- endif %}
+{%- if enforce_template %}
+notes_for_reviewer: |
+  ...
 {%- endif %}
 ```
 
@@ -176,6 +183,10 @@ pr_files:
   label: |
     label_key_1
 ...
+{%- endif %}
+{%- if enforce_template %}
+notes_for_reviewer: |
+  ...
 {%- endif %}
 ```
 (replace '...' with the actual values)

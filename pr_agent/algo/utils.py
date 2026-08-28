@@ -137,6 +137,163 @@ def convert_to_markdown_v2(output_data: dict,
     Returns:
         str: The markdown formatted text generated from the input dictionary.
     """
+    compact_mode = get_settings().pr_reviewer.get("compact_mode", True)
+    if compact_mode and gfm_supported:
+        return _convert_to_markdown_compact(output_data, incremental_review, git_provider, files)
+    return _convert_to_markdown_flat(output_data, gfm_supported, incremental_review, git_provider, files)
+
+
+def _convert_to_markdown_compact(output_data: dict,
+                                  incremental_review=None,
+                                  git_provider=None,
+                                  files=None) -> str:
+    """
+    Compact layout: top-level summary card + collapsible sections.
+    - Top card: effort estimate, security flag, issues count (always visible)
+    - Key issues: expanded by default
+    - Other findings: collapsed by default
+    """
+    if not output_data or not output_data.get('review', {}):
+        return ""
+
+    review = output_data['review']
+    todo_summary = review.pop('todo_summary', '')
+
+    # --- Header ---
+    markdown_text = ""
+    if not incremental_review:
+        markdown_text += f"{PRReviewHeader.REGULAR.value} 🔍\n\n"
+    else:
+        markdown_text += f"{PRReviewHeader.INCREMENTAL.value} 🔍\n\n"
+        markdown_text += f"⏮️ Review for commits since previous PR-Agent review {incremental_review}.\n\n"
+
+    if get_settings().get("pr_reviewer.enable_intro_text", False):
+        markdown_text += f"Here are some key observations to aid the review process:\n\n"
+
+    # --- Top summary card (always visible) ---
+    markdown_text += "<table>\n"
+
+    # Effort estimate
+    effort_value = review.get('estimated_effort_to_review_[1-5]')
+    if effort_value is not None:
+        value = str(effort_value).strip()
+        if value.isnumeric():
+            value_int = int(value)
+        else:
+            try:
+                value_int = int(value.split(',')[0])
+            except ValueError:
+                value_int = 0
+        if value_int > 0:
+            blue_bars = '🔵' * value_int
+            white_bars = '⚪' * (5 - value_int)
+            markdown_text += f"<tr><td>⏱️&nbsp;<strong>Estimated effort to review</strong>: {value_int} {blue_bars}{white_bars}</td></tr>\n"
+
+    # Security flag
+    security = review.get('security_concerns', '')
+    if security and not is_value_no(security):
+        markdown_text += f"<tr><td>🔒&nbsp;<strong>Security concerns detected</strong></td></tr>\n"
+    else:
+        markdown_text += f"<tr><td>🔒&nbsp;<strong>No security concerns identified</strong></td></tr>\n"
+
+    # Tests status
+    tests = review.get('relevant_tests', '')
+    if tests:
+        tests_str = str(tests).strip().lower()
+        if is_value_no(tests_str):
+            markdown_text += f"<tr><td>🧪&nbsp;<strong>No relevant tests</strong></td></tr>\n"
+        else:
+            markdown_text += f"<tr><td>🧪&nbsp;<strong>PR contains tests</strong></td></tr>\n"
+
+    # Issues count
+    key_issues = review.get('key_issues_to_review', [])
+    if key_issues and not is_value_no(key_issues):
+        num_issues = len(key_issues) if isinstance(key_issues, list) else 0
+        markdown_text += f"<tr><td>⚡&nbsp;<strong>{num_issues} issue(s)</strong> to review</td></tr>\n"
+    else:
+        markdown_text += f"<tr><td>⚡&nbsp;<strong>No major issues detected</strong></td></tr>\n"
+
+    markdown_text += "</table>\n\n"
+
+    # --- Key Issues section (expanded by default) ---
+    if key_issues and not is_value_no(key_issues) and isinstance(key_issues, list):
+        markdown_text += "<details open>\n<summary><strong>⚡ Recommended Focus Areas for Review</strong></summary>\n\n"
+        for issue in key_issues:
+            try:
+                if not issue or not isinstance(issue, dict):
+                    continue
+                relevant_file = issue.get('relevant_file', '').strip()
+                issue_header = issue.get('issue_header', '').strip()
+                if issue_header.lower() == 'possible bug':
+                    issue_header = 'Possible Issue'
+                issue_content = issue.get('issue_content', '').strip()
+                start_line = int(str(issue.get('start_line', 0)).strip())
+                end_line = int(str(issue.get('end_line', 0)).strip())
+
+                relevant_lines_str = extract_relevant_lines_str(end_line, files, relevant_file, start_line, dedent=True)
+                reference_link = None
+                if git_provider:
+                    reference_link = git_provider.get_line_link(relevant_file, start_line, end_line)
+
+                if reference_link:
+                    if relevant_lines_str:
+                        markdown_text += f"<details><summary><a href='{reference_link}'><strong>{issue_header}</strong></a>\n\n{issue_content}\n</summary>\n\n{relevant_lines_str}\n\n</details>\n\n"
+                    else:
+                        markdown_text += f"<a href='{reference_link}'><strong>{issue_header}</strong></a><br>{issue_content}\n\n"
+                else:
+                    markdown_text += f"<strong>{issue_header}</strong><br>{issue_content}\n\n"
+            except Exception as e:
+                get_logger().exception(f"Failed to process key issue: {e}")
+        markdown_text += "</details>\n\n"
+
+    # --- Findings & Observations (collapsed by default) ---
+    findings_content = ""
+
+    # Security details
+    if security and not is_value_no(security):
+        security_detail = emphasize_header(security.strip())
+        findings_content += f"🔒&nbsp;<strong>Security concerns</strong><br><br>\n\n{security_detail}\n\n"
+
+    # TODO sections
+    todo_sections = review.get('todo_sections', '')
+    if todo_sections and not is_value_no(todo_sections):
+        markdown_todo_items = format_todo_items(todo_sections, git_provider, True)
+        findings_content += f"📝&nbsp;<strong>TODO sections</strong>\n<br><br>\n{markdown_todo_items}\n\n"
+
+    # Can be split
+    can_be_split = review.get('can_be_split', '')
+    if can_be_split and not is_value_no(can_be_split):
+        findings_content += f"🔀&nbsp;{process_can_be_split('🔀', can_be_split)}\n\n"
+
+    # Ticket compliance
+    ticket_compliance = review.get('ticket_compliance_check', '')
+    if ticket_compliance:
+        ticket_md = ticket_markdown_logic('🎫', '', ticket_compliance, True)
+        if ticket_md:
+            findings_content += ticket_md + "\n\n"
+
+    # Contribution time estimate
+    time_estimate = review.get('contribution_time_cost_estimate', '')
+    if time_estimate and isinstance(time_estimate, dict):
+        findings_content += f"⏳&nbsp;<strong>Contribution time estimate</strong> (best, average, worst case): "
+        findings_content += f"{time_estimate.get('best_case', 'N/A').replace('m', ' minutes')} | {time_estimate.get('average_case', 'N/A').replace('m', ' minutes')} | {time_estimate.get('worst_case', 'N/A').replace('m', ' minutes')}\n\n"
+
+    if findings_content:
+        markdown_text += "<details>\n<summary><strong>📋 Findings & Observations</strong></summary>\n\n"
+        markdown_text += findings_content
+        markdown_text += "</details>\n\n"
+
+    return markdown_text
+
+
+def _convert_to_markdown_flat(output_data: dict,
+                               gfm_supported: bool = True,
+                               incremental_review=None,
+                               git_provider=None,
+                               files=None) -> str:
+    """
+    Original flat layout (compact_mode=false fallback).
+    """
 
     emojis = {
         "Can be split": "🔀",
@@ -259,7 +416,6 @@ def convert_to_markdown_v2(output_data: dict,
                 markdown_text += process_can_be_split(emoji, value)
                 markdown_text += f"</td></tr>\n"
         elif 'key issues to review' in key_nice.lower():
-            # value is a list of issues
             if is_value_no(value):
                 if gfm_supported:
                     markdown_text += f"<tr><td>"
@@ -271,7 +427,6 @@ def convert_to_markdown_v2(output_data: dict,
                 issues = value
                 if gfm_supported:
                     markdown_text += f"<tr><td>"
-                    # markdown_text += f"{emoji}&nbsp;<strong>{key_nice}</strong><br><br>\n\n"
                     markdown_text += f"{emoji}&nbsp;<strong>Recommended focus areas for review</strong><br><br>\n\n"
                 else:
                     markdown_text += f"### {emoji} Recommended focus areas for review\n\n#### \n"
@@ -282,7 +437,7 @@ def convert_to_markdown_v2(output_data: dict,
                         relevant_file = issue.get('relevant_file', '').strip()
                         issue_header = issue.get('issue_header', '').strip()
                         if issue_header.lower() == 'possible bug':
-                            issue_header = 'Possible Issue'  # Make the header less frightening
+                            issue_header = 'Possible Issue'
                         issue_content = issue.get('issue_content', '').strip()
                         start_line = int(str(issue.get('start_line', 0)).strip())
                         end_line = int(str(issue.get('end_line', 0)).strip())

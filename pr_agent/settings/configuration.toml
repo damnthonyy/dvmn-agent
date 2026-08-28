@@ -96,6 +96,7 @@ minimal_commits_for_incremental_review=0
 minimal_minutes_for_incremental_review=0
 enable_intro_text=true
 enable_help_text=false # Determines whether to include help text in the PR review. Enabled by default.
+compact_mode=true # when true, uses collapsible sections with a top-level summary card
 
 [pr_description] # /describe #
 publish_labels=false
@@ -120,6 +121,8 @@ inline_file_summary=false # false, true, 'table'
 use_description_markers=false
 enable_large_pr_handling=true
 include_generated_by_header=true
+enforce_template=true # when true, output follows a fixed section order: PR Type, Summary, What Changed, Diagram (conditional), Notes for Reviewer
+diagram_min_files=3 # minimum number of changed files to include the diagram section
 #custom_labels = ['Bug fix', 'Tests', 'Bug fix with tests', 'Enhancement', 'Documentation', 'Other']
 max_ai_calls=4
 async_ai_calls=true
@@ -144,6 +147,8 @@ suggestions_score_threshold=0 # [0-10]| recommend not to set this value above 8,
 new_score_mechanism=true
 new_score_mechanism_th_high=9
 new_score_mechanism_th_medium=7
+show_scores=true # show score column in suggestions table
+max_suggestions_displayed=10 # max number of suggestions to display in the table
 # params for '/improve --extended' mode
 auto_extended_mode=true
 num_code_suggestions_per_chunk=3
