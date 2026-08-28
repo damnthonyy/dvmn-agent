@@ -232,6 +232,7 @@ ignore_bot_pr = true
 
 [dashboard]
 access_token = ""   # if non-empty, the /dashboard page requires this token via ?token= or the X-Dashboard-Token header
+cache_ttl_seconds = 60  # how long a collected snapshot is served before the next request refreshes it
 
 [github_action_config]
 # auto_review = true    # set as env var in .github/workflows/dvmn-agent.yaml

@@ -1,16 +1,28 @@
-"""Centralized dashboard (issue #4) — minimal foundation.
+"""Centralized dashboard (issue #4) — data collection, cache and JSON API.
 
-Serves an HTML page, mounted on the existing GitHub App FastAPI server, that lists
-every repository where the GitHub App is installed together with its open pull
-requests. Agent processing status and refresh controls are intentionally left for a
-follow-up step (see issue #4), but the data model below leaves room for them.
+Serves both:
+
+* ``GET /dashboard`` — the server-rendered HTML page, and
+* ``GET /api/dashboard/repos`` / ``POST /api/dashboard/refresh`` — the JSON API
+  consumed by the standalone front-end.
+
+Both read through the same TTL cache. Collecting the data hits the GitHub API
+once per installed repository, which is far too slow to run inline on the event
+loop: this server also receives the GitHub webhooks, so a blocking dashboard
+request would delay PR processing. Every refresh therefore runs in a worker
+thread, guarded by a lock so concurrent requests share one refresh instead of
+stampeding the GitHub API.
 """
 
+import asyncio
 import os
 import re
+import secrets
+import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.templating import Jinja2Templates
 from github import Github, GithubIntegration
 
@@ -21,6 +33,9 @@ router = APIRouter()
 
 _TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "templates")
 templates = Jinja2Templates(directory=_TEMPLATES_DIR)
+
+# Seconds a collected snapshot stays fresh before the next request triggers a refresh.
+_DEFAULT_CACHE_TTL = 60.0
 
 
 def _build_app_integration() -> GithubIntegration:
@@ -96,6 +111,10 @@ def _list_installation_repos(client: Github) -> list:
 
 def collect_dashboard_data() -> list:
     """Collect installed repos and their open PRs across all App installations.
+
+    Blocking: performs several synchronous GitHub API calls per repository. Callers
+    on the event loop must go through :func:`get_dashboard_data`, never call this
+    directly.
 
     Returns a list of dicts shaped as::
 
@@ -176,23 +195,114 @@ def collect_dashboard_data() -> list:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Cache
+# ---------------------------------------------------------------------------
+
+_cache_lock = asyncio.Lock()
+_cache = {
+    "repos": None,       # last successfully collected list, or None
+    "monotonic": 0.0,    # time.monotonic() of that collection, for TTL maths
+    "collected_at": None,  # aware datetime of that collection, for display
+}
+
+
+def _cache_ttl() -> float:
+    try:
+        return float(get_settings().get("DASHBOARD.CACHE_TTL_SECONDS", _DEFAULT_CACHE_TTL))
+    except (TypeError, ValueError):
+        return _DEFAULT_CACHE_TTL
+
+
+def _payload(cached: bool, stale: bool = False) -> dict:
+    repos = _cache["repos"] or []
+    collected_at = _cache["collected_at"]
+    return {
+        "repos": repos,
+        "repo_count": len(repos),
+        "open_pr_count": sum(len(r.get("pulls") or []) for r in repos),
+        "collected_at": collected_at.isoformat() if collected_at else None,
+        "collected_ago": _relative_time(collected_at.isoformat()) if collected_at else "—",
+        "cached": cached,
+        "stale": stale,
+    }
+
+
+def reset_cache() -> None:
+    """Drop the cached snapshot. Intended for tests and for config reloads."""
+    _cache.update({"repos": None, "monotonic": 0.0, "collected_at": None})
+
+
+async def get_dashboard_data(force_refresh: bool = False) -> dict:
+    """Return the dashboard payload, refreshing off the event loop when stale.
+
+    The lock makes concurrent callers share a single refresh. When a refresh fails
+    but a previous snapshot exists, the stale snapshot is served (flagged as such)
+    rather than failing the request on a transient GitHub error.
+    """
+    async with _cache_lock:
+        fresh = (
+            _cache["repos"] is not None
+            and (time.monotonic() - _cache["monotonic"]) < _cache_ttl()
+        )
+        if fresh and not force_refresh:
+            return _payload(cached=True)
+
+        try:
+            repos = await run_in_threadpool(collect_dashboard_data)
+        except Exception as e:
+            if _cache["repos"] is None:
+                raise
+            get_logger().error(f"Dashboard: refresh failed, serving stale snapshot: {e}")
+            return _payload(cached=True, stale=True)
+
+        _cache["repos"] = repos
+        _cache["monotonic"] = time.monotonic()
+        _cache["collected_at"] = datetime.now(timezone.utc)
+        return _payload(cached=False)
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
 def _check_access(request: Request) -> None:
     """Optional token guard. Open access when DASHBOARD.ACCESS_TOKEN is unset/empty."""
     expected = get_settings().get("DASHBOARD.ACCESS_TOKEN", "")
     if not expected:
         return
     provided = request.query_params.get("token") or request.headers.get("X-Dashboard-Token")
-    if provided != expected:
+    if not secrets.compare_digest(str(provided or ""), str(expected)):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+async def _payload_or_error(force_refresh: bool = False) -> dict:
+    try:
+        return await get_dashboard_data(force_refresh=force_refresh)
+    except ValueError as e:
+        # Misconfiguration (not a GitHub App deployment, missing credentials).
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @router.get("/dashboard")
 async def dashboard(request: Request):
     _check_access(request)
-    try:
-        repos = collect_dashboard_data()
-    except ValueError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+    payload = await _payload_or_error()
     return templates.TemplateResponse(
-        "dashboard.html", {"request": request, "repos": repos}
+        "dashboard.html",
+        {"request": request, "repos": payload["repos"], "collected_ago": payload["collected_ago"]},
     )
+
+
+@router.get("/api/dashboard/repos")
+async def api_dashboard_repos(request: Request):
+    """Installed repositories and their open PRs, served from the TTL cache."""
+    _check_access(request)
+    return await _payload_or_error()
+
+
+@router.post("/api/dashboard/refresh")
+async def api_dashboard_refresh(request: Request):
+    """Force a refresh, bypassing the TTL, and return the new snapshot."""
+    _check_access(request)
+    return await _payload_or_error(force_refresh=True)
