@@ -28,6 +28,7 @@ from github import Github, GithubIntegration
 
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
+from pr_agent.servers import activity_store
 
 router = APIRouter()
 
@@ -306,3 +307,24 @@ async def api_dashboard_refresh(request: Request):
     """Force a refresh, bypassing the TTL, and return the new snapshot."""
     _check_access(request)
     return await _payload_or_error(force_refresh=True)
+
+
+@router.get("/api/dashboard/activity")
+async def api_dashboard_activity(
+    request: Request,
+    limit: int = 100,
+    repo: str = None,
+    status: str = None,
+):
+    """Recent webhook deliveries and what the agent did with them (issue #10).
+
+    Never includes the stored payload: it holds the raw GitHub body and is only
+    read server-side, by replay.
+    """
+    _check_access(request)
+    events = await activity_store.alist_events(limit=limit, repo=repo, status=status)
+    return {
+        "events": events,
+        "count": len(events),
+        "persistent": bool(get_settings().get("DASHBOARD.ACTIVITY_PERSIST", False)),
+    }
