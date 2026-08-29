@@ -5,4 +5,7 @@ branding:
   color: 'green'
 runs:
   using: 'docker'
-  image: 'Dockerfile.github_action_dockerhub'
+  # Build from source rather than a prebuilt image: it keeps the action working
+  # without a published :github_action tag, and lets a workflow pin a branch
+  # (uses: damnthonyy/dvmn-agent@my-branch) to try changes on a real PR.
+  image: 'Dockerfile.github_action'
