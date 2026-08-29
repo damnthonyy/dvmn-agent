@@ -52,6 +52,9 @@ class TestConvertToMarkdown:
             'estimated_effort_to_review_[1-5]': '1, because the changes are minimal and straightforward, focusing on a single functionality addition.\n',
             'relevant_tests': 'No\n', 'possible_issues': 'No\n', 'security_concerns': 'No\n'}}
 
+        # Compact layout (the default since compact_mode): fixed-order summary card.
+        # `possible_issues` is no longer rendered — it left the review schema, and the
+        # issue row is derived from key_issues_to_review instead.
         expected_output = textwrap.dedent(f"""\
             {PRReviewHeader.REGULAR.value} 🔍
 
@@ -59,10 +62,9 @@ class TestConvertToMarkdown:
 
             <table>
             <tr><td>⏱️&nbsp;<strong>Estimated effort to review</strong>: 1 🔵⚪⚪⚪⚪</td></tr>
-            <tr><td>🧪&nbsp;<strong>No relevant tests</strong></td></tr>
-            <tr><td>&nbsp;<strong>Possible issues</strong>: No
-            </td></tr>
             <tr><td>🔒&nbsp;<strong>No security concerns identified</strong></td></tr>
+            <tr><td>🧪&nbsp;<strong>No relevant tests</strong></td></tr>
+            <tr><td>⚡&nbsp;<strong>No major issues detected</strong></td></tr>
             </table>
         """)
 
@@ -112,12 +114,16 @@ class TestConvertToMarkdown:
             Here are some key observations to aid the review process:
 
             <table>
-            <tr><td>⚡&nbsp;<strong>Recommended focus areas for review</strong><br><br>
+            <tr><td>🔒&nbsp;<strong>No security concerns identified</strong></td></tr>
+            <tr><td>⚡&nbsp;<strong>1 issue(s)</strong> to review</td></tr>
+            </table>
+
+            <details open>
+            <summary><strong>⚡ Recommended Focus Areas for Review</strong></summary>
 
             <a href='{reference_link}'><strong>Code Smell</strong></a><br>The function is too long and complex.
 
-            </td></tr>
-            </table>
+            </details>
         """)
 
         assert convert_to_markdown_v2(input_data, git_provider=mock_git_provider).strip() == expected_output.strip()
@@ -142,9 +148,14 @@ class TestConvertToMarkdown:
             Here are some key observations to aid the review process:
 
             <table>
-            <tr><td>
+            <tr><td>🔒&nbsp;<strong>No security concerns identified</strong></td></tr>
+            <tr><td>⚡&nbsp;<strong>No major issues detected</strong></td></tr>
+            </table>
 
-            **🎫 Ticket compliance analysis ✅**
+            <details>
+            <summary><strong>📋 Findings & Observations</strong></summary>
+
+            ### 🎫 Ticket compliance analysis ✅
 
 
 
@@ -157,8 +168,11 @@ class TestConvertToMarkdown:
 
 
 
-            </td></tr>
-            </table>
+
+
+
+
+            </details>
         """)
 
         assert convert_to_markdown_v2(input_data).strip() == expected_output.strip()
@@ -189,7 +203,14 @@ class TestConvertToMarkdown:
             Here are some key observations to aid the review process:
 
             <table>
-            <tr><td>🔀 <strong>Multiple PR themes</strong><br><br>
+            <tr><td>🔒&nbsp;<strong>No security concerns identified</strong></td></tr>
+            <tr><td>⚡&nbsp;<strong>No major issues detected</strong></td></tr>
+            </table>
+
+            <details>
+            <summary><strong>📋 Findings & Observations</strong></summary>
+
+            🔀 <strong>Multiple PR themes</strong><br><br>
 
             <details><summary>
             Sub-PR theme: <b>Refactoring</b></summary>
@@ -216,8 +237,9 @@ class TestConvertToMarkdown:
 
             </details>
 
-            </td></tr>
-            </table>
+
+
+            </details>
         """)
 
         assert convert_to_markdown_v2(input_data).strip() == expected_output.strip()
@@ -233,14 +255,22 @@ class TestConvertToMarkdown:
             }
         }
 
-        expected_output = textwrap.dedent(f"""
-            {PRReviewHeader.REGULAR.value} 🔍
+        expected_output = textwrap.dedent("""\
+            ## PR Reviewer Guide 🔍
 
             Here are some key observations to aid the review process:
 
             <table>
-            <tr><td>⏳&nbsp;<strong>Contribution time estimate</strong> (best, average, worst case): 1h | 2h | 30 minutes</td></tr>
+            <tr><td>🔒&nbsp;<strong>No security concerns identified</strong></td></tr>
+            <tr><td>⚡&nbsp;<strong>No major issues detected</strong></td></tr>
             </table>
+
+            <details>
+            <summary><strong>📋 Findings & Observations</strong></summary>
+
+            ⏳&nbsp;<strong>Contribution time estimate</strong> (best, average, worst case): 1h | 2h | 30 minutes
+
+            </details>
         """)
         assert convert_to_markdown_v2(input_data).strip() == expected_output.strip()
 
