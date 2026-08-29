@@ -233,6 +233,11 @@ ignore_bot_pr = true
 [dashboard]
 access_token = ""   # if non-empty, the /dashboard page requires this token via ?token= or the X-Dashboard-Token header
 cache_ttl_seconds = 60  # how long a collected snapshot is served before the next request refreshes it
+activity_enabled = true       # record incoming webhook deliveries and their outcome
+activity_persist = false      # false = in-memory, cleared on restart (no persistent disk in the current deployment)
+activity_db_path = "data/activity.db"  # only used when activity_persist = true; must point at a persistent volume
+activity_retention = 500      # rows kept, oldest pruned on insert
+activity_max_payload_bytes = 262144  # bodies above this are not stored, making the event non-replayable
 
 [github_action_config]
 # auto_review = true    # set as env var in .github/workflows/dvmn-agent.yaml

@@ -23,6 +23,7 @@ from pr_agent.git_providers.utils import apply_repo_settings
 from pr_agent.identity_providers import get_identity_provider
 from pr_agent.identity_providers.identity_provider import Eligibility
 from pr_agent.log import LoggingFormat, get_logger, setup_logger
+from pr_agent.servers import activity_store
 from pr_agent.servers.dashboard import router as dashboard_router
 from pr_agent.servers.utils import DefaultDictWithTimeout, verify_signature
 
@@ -52,7 +53,13 @@ async def handle_github_webhooks(background_tasks: BackgroundTasks, request: Req
     context["installation_id"] = installation_id
     context["settings"] = copy.deepcopy(global_settings)
     context["git_provider"] = {}
-    background_tasks.add_task(handle_request, body, event=request.headers.get("X-GitHub-Event", None))
+    event = request.headers.get("X-GitHub-Event", None)
+    # Activity log (issue #10). Recorded as a background task so the webhook ack
+    # stays immediate — GitHub re-delivers on a slow ack — and added before the
+    # handler so the row exists even if handle_request fails straight away.
+    delivery_id = request.headers.get("X-GitHub-Delivery", None)
+    background_tasks.add_task(activity_store.arecord_received, delivery_id, event, body)
+    background_tasks.add_task(handle_request, body, event=event, delivery_id=delivery_id)
     return {}
 
 
@@ -311,18 +318,22 @@ def should_process_pr_logic(body) -> bool:
     return True
 
 
-async def handle_request(body: Dict[str, Any], event: str):
+async def handle_request(body: Dict[str, Any], event: str, delivery_id: str = None):
     """
     Handle incoming GitHub webhook requests.
 
     Args:
         body: The request body.
         event: The GitHub event type (e.g. "pull_request", "issue_comment", etc.).
+        delivery_id: X-GitHub-Delivery header, used to close the matching row in
+            the activity log (issue #10). None disables activity recording.
     """
     action = body.get("action")  # "created", "opened", "reopened", "ready_for_review", "review_requested", "synchronize"
     get_logger().debug(f"Handling request with event: {event}, action: {action}")
     if not action:
         get_logger().debug(f"No action found in request body, exiting handle_request")
+        await activity_store.amark_outcome(
+            delivery_id, activity_store.STATUS_IGNORED, activity_store.REASON_NO_ACTION)
         return {}
     agent = PRAgent()
     log_context, sender, sender_id, sender_type = get_log_context(body, event, action, build_number)
@@ -330,33 +341,47 @@ async def handle_request(body: Dict[str, Any], event: str):
     # logic to ignore PRs opened by bot, PRs with specific titles, labels, source branches, or target branches
     if is_bot_user(sender, sender_type) and 'check_run' not in body:
         get_logger().debug(f"Request ignored: bot user detected")
+        await activity_store.amark_outcome(
+            delivery_id, activity_store.STATUS_IGNORED, activity_store.REASON_BOT_USER)
         return {}
     if action != 'created' and 'check_run' not in body:
         if not should_process_pr_logic(body):
             get_logger().debug(f"Request ignored: PR logic filtering")
+            await activity_store.amark_outcome(
+                delivery_id, activity_store.STATUS_IGNORED, activity_store.REASON_PR_LOGIC_FILTER)
             return {}
 
-    if 'check_run' in body:  # handle failed checks
-        # get_logger().debug(f'Request body', artifact=body, event=event) # added inside handle_checks
-        pass
-    # handle comments on PRs
-    elif action == 'created':
-        get_logger().debug(f'Request body', artifact=body, event=event)
-        await handle_comments_on_pr(body, event, sender, sender_id, action, log_context, agent)
-    # handle new PRs
-    elif event == 'pull_request' and action != 'synchronize' and action != 'closed':
-        get_logger().debug(f'Request body', artifact=body, event=event)
-        await handle_new_pr_opened(body, event, sender, sender_id, action, log_context, agent)
-    elif event == "issue_comment" and 'edited' in action:
-        pass # handle_checkbox_clicked
-    # handle pull_request event with synchronize action - "push trigger" for new commits
-    elif event == 'pull_request' and action == 'synchronize':
-        await handle_push_trigger_for_new_commits(body, event, sender,sender_id,  action, log_context, agent)
-    elif event == 'pull_request' and action == 'closed':
-        if get_settings().get("CONFIG.ANALYTICS_FOLDER", ""):
-            handle_closed_pr(body, event, action, log_context)
-    else:
-        get_logger().info(f"event {event=} action {action=} does not require any handling")
+    await activity_store.amark_processing(delivery_id)
+    try:
+        if 'check_run' in body:  # handle failed checks
+            # get_logger().debug(f'Request body', artifact=body, event=event) # added inside handle_checks
+            pass
+        # handle comments on PRs
+        elif action == 'created':
+            get_logger().debug(f'Request body', artifact=body, event=event)
+            await handle_comments_on_pr(body, event, sender, sender_id, action, log_context, agent)
+        # handle new PRs
+        elif event == 'pull_request' and action != 'synchronize' and action != 'closed':
+            get_logger().debug(f'Request body', artifact=body, event=event)
+            await handle_new_pr_opened(body, event, sender, sender_id, action, log_context, agent)
+        elif event == "issue_comment" and 'edited' in action:
+            pass # handle_checkbox_clicked
+        # handle pull_request event with synchronize action - "push trigger" for new commits
+        elif event == 'pull_request' and action == 'synchronize':
+            await handle_push_trigger_for_new_commits(body, event, sender,sender_id,  action, log_context, agent)
+        elif event == 'pull_request' and action == 'closed':
+            if get_settings().get("CONFIG.ANALYTICS_FOLDER", ""):
+                handle_closed_pr(body, event, action, log_context)
+        else:
+            get_logger().info(f"event {event=} action {action=} does not require any handling")
+            await activity_store.amark_outcome(
+                delivery_id, activity_store.STATUS_IGNORED, activity_store.REASON_UNHANDLED_EVENT)
+            return {}
+    except Exception as e:
+        await activity_store.amark_outcome(
+            delivery_id, activity_store.STATUS_FAILED, reason=str(e)[:500])
+        raise
+    await activity_store.amark_outcome(delivery_id, activity_store.STATUS_COMPLETED)
     return {}
 
 
