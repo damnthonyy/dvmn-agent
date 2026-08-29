@@ -185,6 +185,7 @@ def test_memory_mode_starts_empty_after_reset(monkeypatch):
 # Async helpers never break the webhook path
 # ---------------------------------------------------------------------------
 
+@pytest.mark.asyncio
 async def test_async_helpers_are_noops_without_delivery_id(memory_store):
     await store.arecord_received(None, "pull_request", _body())
     await store.amark_processing(None)
@@ -192,12 +193,14 @@ async def test_async_helpers_are_noops_without_delivery_id(memory_store):
     assert store.count_events() == 0
 
 
+@pytest.mark.asyncio
 async def test_async_helpers_are_noops_when_disabled(monkeypatch, memory_store):
     monkeypatch.setattr(store, "get_settings", _settings({"DASHBOARD.ACTIVITY_ENABLED": False}))
     await store.arecord_received("d", "pull_request", _body())
     assert store.count_events() == 0
 
 
+@pytest.mark.asyncio
 async def test_async_helpers_swallow_storage_errors(monkeypatch, memory_store):
     """A broken activity log must never take the webhook pipeline down with it."""
     def _boom(*a, **k):
