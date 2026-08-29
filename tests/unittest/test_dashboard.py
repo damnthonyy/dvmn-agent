@@ -178,6 +178,7 @@ def _counting_collector(payloads):
     return _collect, calls
 
 
+@pytest.mark.asyncio
 async def test_get_dashboard_data_collects_then_serves_from_cache(monkeypatch):
     _patch_settings(monkeypatch)
     collect, calls = _counting_collector([[{"repo_full_name": "acme/a", "pulls": [{"number": 1}]}]])
@@ -195,6 +196,7 @@ async def test_get_dashboard_data_collects_then_serves_from_cache(monkeypatch):
     assert second["collected_at"] is not None
 
 
+@pytest.mark.asyncio
 async def test_get_dashboard_data_force_refresh_bypasses_cache(monkeypatch):
     _patch_settings(monkeypatch)
     collect, calls = _counting_collector([[], []])
@@ -207,6 +209,7 @@ async def test_get_dashboard_data_force_refresh_bypasses_cache(monkeypatch):
     assert payload["cached"] is False
 
 
+@pytest.mark.asyncio
 async def test_get_dashboard_data_refreshes_once_ttl_expired(monkeypatch):
     _patch_settings_with(monkeypatch, {"DASHBOARD.CACHE_TTL_SECONDS": 0})
     collect, calls = _counting_collector([[], []])
@@ -218,6 +221,7 @@ async def test_get_dashboard_data_refreshes_once_ttl_expired(monkeypatch):
     assert calls["n"] == 2
 
 
+@pytest.mark.asyncio
 async def test_get_dashboard_data_serves_stale_snapshot_on_refresh_failure(monkeypatch):
     _patch_settings(monkeypatch)
     good = [{"repo_full_name": "acme/a", "pulls": []}]
@@ -231,6 +235,7 @@ async def test_get_dashboard_data_serves_stale_snapshot_on_refresh_failure(monke
     assert payload["repo_count"] == 1, "the previous snapshot must survive a failed refresh"
 
 
+@pytest.mark.asyncio
 async def test_get_dashboard_data_propagates_failure_without_cache(monkeypatch):
     _patch_settings(monkeypatch)
     collect, _ = _counting_collector([RuntimeError("github down")])
@@ -240,6 +245,7 @@ async def test_get_dashboard_data_propagates_failure_without_cache(monkeypatch):
         await dashboard.get_dashboard_data()
 
 
+@pytest.mark.asyncio
 async def test_concurrent_callers_share_a_single_refresh(monkeypatch):
     _patch_settings(monkeypatch)
     collect, calls = _counting_collector([[], []])
@@ -311,6 +317,7 @@ def test_api_repos_returns_503_on_misconfiguration(monkeypatch):
     assert "GitHub App deployment" in resp.json()["detail"]
 
 
+@pytest.mark.asyncio
 async def test_collection_runs_off_the_event_loop_thread(monkeypatch):
     """The webhook server shares this event loop: collection must not block it."""
     _patch_settings(monkeypatch)
