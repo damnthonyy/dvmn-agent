@@ -701,6 +701,72 @@ class GithubProvider(GitProvider):
     def get_pr_branch(self):
         return self.pr.head.ref
 
+    def _graphql_url(self) -> str:
+        """GraphQL lives beside the REST root, not under it.
+
+        github.com is https://api.github.com/graphql, but GitHub Enterprise
+        serves REST at https://host/api/v3 and GraphQL at https://host/api/graphql
+        — so appending '/graphql' to base_url is wrong there.
+        """
+        base = self.base_url.rstrip("/")
+        if base.endswith("/api/v3"):
+            return base[: -len("/v3")] + "/graphql"
+        return base + "/graphql"
+
+    def get_linked_issues(self) -> list:
+        """Issues GitHub itself resolves this PR as closing.
+
+        Covers both closing keywords in the body and links made by hand in the
+        Development sidebar — the latter being invisible to any parser, since
+        nobody wrote them in the text.
+
+        Returns [] on any failure, which callers must read as "unknown", not as
+        "nothing is linked": /describe rewrites the PR body, and GitHub derives
+        keyword links from that body, so a wrong empty answer here can end up
+        dropping the link and stopping the issue from auto-closing on merge.
+        """
+        query = """
+query($owner:String!, $name:String!, $number:Int!) {
+  repository(owner:$owner, name:$name) {
+    pullRequest(number:$number) {
+      closingIssuesReferences(first:20) {
+        nodes { number title url state }
+      }
+    }
+  }
+}"""
+        try:
+            owner, _, name = self.repo.partition("/")
+            if not owner or not name:
+                get_logger().warning(f"Cannot resolve linked issues, unexpected repo path: {self.repo}")
+                return []
+            _, data = self.pr._requester.requestJsonAndCheck(
+                "POST", self._graphql_url(),
+                input={"query": query,
+                       "variables": {"owner": owner, "name": name, "number": self.pr_num}},
+            )
+            # GraphQL answers 200 even when it fails; the failure is in 'errors'.
+            if not isinstance(data, dict) or data.get("errors"):
+                get_logger().warning("Failed to resolve linked issues",
+                                     artifact={"errors": (data or {}).get("errors")})
+                return []
+            nodes = (((data.get("data") or {}).get("repository") or {}).get("pullRequest") or {}) \
+                .get("closingIssuesReferences", {}).get("nodes")
+            if not nodes:
+                return []
+            issues = []
+            for node in nodes:
+                if not isinstance(node, dict) or not node.get("number"):
+                    continue
+                issues.append({"number": node.get("number"),
+                               "title": node.get("title") or "",
+                               "url": node.get("url") or "",
+                               "state": (node.get("state") or "").lower()})
+            return issues
+        except Exception as e:
+            get_logger().warning(f"Failed to resolve linked issues for PR {self.pr_num}: {e}")
+            return []
+
     def get_pr_owner_id(self) -> str | None:
         if not self.repo:
             return None
