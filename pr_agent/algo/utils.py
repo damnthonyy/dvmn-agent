@@ -263,12 +263,15 @@ def _convert_to_markdown_compact(output_data: dict,
     # Can be split
     can_be_split = review.get('can_be_split', '')
     if can_be_split and not is_value_no(can_be_split):
-        findings_content += f"🔀&nbsp;{process_can_be_split('🔀', can_be_split)}\n\n"
+        # process_can_be_split already prefixes the emoji it is handed.
+        findings_content += f"{process_can_be_split('🔀', can_be_split)}\n\n"
 
     # Ticket compliance
     ticket_compliance = review.get('ticket_compliance_check', '')
     if ticket_compliance:
-        ticket_md = ticket_markdown_logic('🎫', '', ticket_compliance, True)
+        # gfm_supported=False: the gfm branch emits <tr><td> wrappers meant for the
+        # flat table layout, which would land orphaned inside this <details> block.
+        ticket_md = ticket_markdown_logic('🎫', '', ticket_compliance, False)
         if ticket_md:
             findings_content += ticket_md + "\n\n"
 
