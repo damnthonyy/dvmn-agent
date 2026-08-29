@@ -1,9 +1,12 @@
+import asyncio
+import threading
 from datetime import datetime
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
 import pr_agent.servers.dashboard as dashboard
 
@@ -140,3 +143,191 @@ def test_collect_dashboard_data_returns_empty_when_no_installations(monkeypatch)
     monkeypatch.setattr(dashboard, "_build_app_integration", lambda: integration)
 
     assert dashboard.collect_dashboard_data() == []
+
+
+# ---------------------------------------------------------------------------
+# Cache / get_dashboard_data
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _clear_cache():
+    dashboard.reset_cache()
+    yield
+    dashboard.reset_cache()
+
+
+def _patch_settings_with(monkeypatch, overrides):
+    """Patch get_settings so .get(key, default) honours `overrides` then the default."""
+    monkeypatch.setattr(
+        dashboard,
+        "get_settings",
+        lambda: SimpleNamespace(get=lambda key, default=None: overrides.get(key, default)),
+    )
+
+
+def _counting_collector(payloads):
+    calls = {"n": 0}
+
+    def _collect():
+        calls["n"] += 1
+        value = payloads[min(calls["n"] - 1, len(payloads) - 1)]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    return _collect, calls
+
+
+@pytest.mark.asyncio
+async def test_get_dashboard_data_collects_then_serves_from_cache(monkeypatch):
+    _patch_settings(monkeypatch)
+    collect, calls = _counting_collector([[{"repo_full_name": "acme/a", "pulls": [{"number": 1}]}]])
+    monkeypatch.setattr(dashboard, "collect_dashboard_data", collect)
+
+    first = await dashboard.get_dashboard_data()
+    second = await dashboard.get_dashboard_data()
+
+    assert calls["n"] == 1, "second call within the TTL must not re-hit GitHub"
+    assert first["cached"] is False
+    assert second["cached"] is True
+    assert second["repo_count"] == 1
+    assert second["open_pr_count"] == 1
+    assert second["stale"] is False
+    assert second["collected_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_get_dashboard_data_force_refresh_bypasses_cache(monkeypatch):
+    _patch_settings(monkeypatch)
+    collect, calls = _counting_collector([[], []])
+    monkeypatch.setattr(dashboard, "collect_dashboard_data", collect)
+
+    await dashboard.get_dashboard_data()
+    payload = await dashboard.get_dashboard_data(force_refresh=True)
+
+    assert calls["n"] == 2
+    assert payload["cached"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_dashboard_data_refreshes_once_ttl_expired(monkeypatch):
+    _patch_settings_with(monkeypatch, {"DASHBOARD.CACHE_TTL_SECONDS": 0})
+    collect, calls = _counting_collector([[], []])
+    monkeypatch.setattr(dashboard, "collect_dashboard_data", collect)
+
+    await dashboard.get_dashboard_data()
+    await dashboard.get_dashboard_data()
+
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_get_dashboard_data_serves_stale_snapshot_on_refresh_failure(monkeypatch):
+    _patch_settings(monkeypatch)
+    good = [{"repo_full_name": "acme/a", "pulls": []}]
+    collect, _ = _counting_collector([good, RuntimeError("github down")])
+    monkeypatch.setattr(dashboard, "collect_dashboard_data", collect)
+
+    await dashboard.get_dashboard_data()
+    payload = await dashboard.get_dashboard_data(force_refresh=True)
+
+    assert payload["stale"] is True
+    assert payload["repo_count"] == 1, "the previous snapshot must survive a failed refresh"
+
+
+@pytest.mark.asyncio
+async def test_get_dashboard_data_propagates_failure_without_cache(monkeypatch):
+    _patch_settings(monkeypatch)
+    collect, _ = _counting_collector([RuntimeError("github down")])
+    monkeypatch.setattr(dashboard, "collect_dashboard_data", collect)
+
+    with pytest.raises(RuntimeError):
+        await dashboard.get_dashboard_data()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_callers_share_a_single_refresh(monkeypatch):
+    _patch_settings(monkeypatch)
+    collect, calls = _counting_collector([[], []])
+    monkeypatch.setattr(dashboard, "collect_dashboard_data", collect)
+
+    results = await asyncio.gather(*(dashboard.get_dashboard_data() for _ in range(5)))
+
+    assert calls["n"] == 1, "the lock must collapse a stampede into one collection"
+    assert sum(1 for r in results if r["cached"] is False) == 1
+
+
+# ---------------------------------------------------------------------------
+# JSON API routes
+# ---------------------------------------------------------------------------
+
+def _client(monkeypatch, overrides=None):
+    _patch_settings_with(monkeypatch, overrides or {})
+    app = FastAPI()
+    app.include_router(dashboard.router)
+    return TestClient(app)
+
+
+def test_api_repos_returns_payload(monkeypatch):
+    monkeypatch.setattr(
+        dashboard, "collect_dashboard_data",
+        lambda: [{"repo_full_name": "acme/a", "pulls": [{"number": 1}, {"number": 2}]}],
+    )
+    resp = _client(monkeypatch).get("/api/dashboard/repos")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["repo_count"] == 1
+    assert body["open_pr_count"] == 2
+    assert body["repos"][0]["repo_full_name"] == "acme/a"
+
+
+def test_api_refresh_bypasses_cache(monkeypatch):
+    collect, calls = _counting_collector([[], []])
+    monkeypatch.setattr(dashboard, "collect_dashboard_data", collect)
+    client = _client(monkeypatch)
+
+    client.get("/api/dashboard/repos")
+    resp = client.post("/api/dashboard/refresh")
+
+    assert resp.status_code == 200
+    assert calls["n"] == 2
+    assert resp.json()["cached"] is False
+
+
+def test_api_repos_requires_token_when_configured(monkeypatch):
+    monkeypatch.setattr(dashboard, "collect_dashboard_data", lambda: [])
+    client = _client(monkeypatch, {"DASHBOARD.ACCESS_TOKEN": "s3cret"})
+
+    assert client.get("/api/dashboard/repos").status_code == 401
+    assert client.get("/api/dashboard/repos?token=s3cret").status_code == 200
+    assert client.get(
+        "/api/dashboard/repos", headers={"X-Dashboard-Token": "s3cret"}
+    ).status_code == 200
+
+
+def test_api_repos_returns_503_on_misconfiguration(monkeypatch):
+    def _boom():
+        raise ValueError("The dashboard requires GitHub App deployment")
+
+    monkeypatch.setattr(dashboard, "collect_dashboard_data", _boom)
+    resp = _client(monkeypatch).get("/api/dashboard/repos")
+
+    assert resp.status_code == 503
+    assert "GitHub App deployment" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_collection_runs_off_the_event_loop_thread(monkeypatch):
+    """The webhook server shares this event loop: collection must not block it."""
+    _patch_settings(monkeypatch)
+    seen = {}
+
+    def _collect():
+        seen["thread"] = threading.current_thread().ident
+        return []
+
+    monkeypatch.setattr(dashboard, "collect_dashboard_data", _collect)
+    await dashboard.get_dashboard_data()
+
+    assert seen["thread"] != threading.current_thread().ident
