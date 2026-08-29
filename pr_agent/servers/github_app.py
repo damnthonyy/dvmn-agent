@@ -455,7 +455,24 @@ middleware = [Middleware(RawContextMiddleware)]
 app = FastAPI(middleware=middleware)
 app.include_router(router)
 app.include_router(dashboard_router)
-app.mount("/public", StaticFiles(directory=os.path.join(os.path.dirname(base_path), "public")), name="public")
+def _mount_public_assets(app: FastAPI) -> None:
+    """Serve public/ when it is present, and carry on when it is not.
+
+    Importing this module must not depend on that directory existing. The GitHub
+    Action runner imports github_app only for handle_line_comments, and its image
+    ships no public/ — StaticFiles raises from its constructor, which used to make
+    the whole module unimportable and took the action down with it.
+    """
+    directory = os.path.join(os.path.dirname(base_path), "public")
+    if not os.path.isdir(directory):
+        get_logger().warning(
+            f"Static assets directory not found, /public will not be served: {directory}"
+        )
+        return
+    app.mount("/public", StaticFiles(directory=directory), name="public")
+
+
+_mount_public_assets(app)
 
 
 def start():
