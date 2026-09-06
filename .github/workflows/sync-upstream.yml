@@ -71,7 +71,9 @@ jobs:
       - name: Open pull request
         if: steps.merge.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN cannot open a PR here, so prefer a PAT
+          # (repo scope, Pull requests: read/write) and fall back to it.
+          GH_TOKEN: ${{ secrets.SYNC_UPSTREAM_PAT || secrets.GITHUB_TOKEN }}
           BRANCH: sync/upstream-${{ github.run_id }}
           CONFLICTS: ${{ steps.merge.outputs.conflicts }}
         run: |
@@ -81,11 +83,21 @@ jobs:
             NOTE="Merge was clean."
           fi
 
-          gh pr create \
-            --base prod \
-            --head "$BRANCH" \
-            --title "sync: bring changes from upstream/main (run ${{ github.run_id }})" \
-            --body "$(printf '%s\n\n%s\n' \
-              "Auto-generated PR to sync with \`upstream/main\` (qodo-ai/pr-agent). The branch starts from \`origin/prod\` and merges \`upstream/main\` on top, so the fork delta is preserved." \
-              "$NOTE")" \
-            || echo "A PR for $BRANCH may already exist."
+          BODY="$(printf '%s\n\n%s\n' \
+            "Auto-generated PR to sync with \`upstream/main\` (qodo-ai/pr-agent). The branch starts from \`origin/prod\` and merges \`upstream/main\` on top, so the fork delta is preserved." \
+            "$NOTE")"
+
+          if gh pr create --base prod --head "$BRANCH" \
+               --title "sync: bring changes from upstream/main (run ${{ github.run_id }})" \
+               --body "$BODY"; then
+            echo "Pull request opened."
+          else
+            echo "::warning::gh pr create failed (GITHUB_TOKEN cannot open PRs; add a SYNC_UPSTREAM_PAT secret). The sync branch is pushed — open the PR manually."
+            {
+              echo "### Sync branch pushed"
+              echo ""
+              echo "[Open the pull request \`$BRANCH\` → \`prod\`](https://github.com/${{ github.repository }}/compare/prod...$BRANCH?expand=1)"
+              echo ""
+              echo "$NOTE"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
