@@ -85,7 +85,10 @@ require_ticket_analysis_review=true
 publish_output_no_suggestions=true # Set to "false" if you only need the reviewer's remarks (not labels, not "security audit", etc.) and want to avoid noisy "No major issues detected" comments.
 persistent_comment=true
 extra_instructions = ""
-num_max_findings = 3
+# Upper bound on findings in `key_issues_to_review`. Kept generous so review depth
+# scales with PR size rather than being a small constant; the prompt instructs the
+# model to order findings by severity so the cap never drops a critical/high one.
+num_max_findings = 8
 final_update_message = true
 # review labels
 enable_review_labels_security=true
