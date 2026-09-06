@@ -34,22 +34,37 @@ jobs:
           # Start from OUR code, not upstream's — this preserves the fork delta.
           git checkout -b "$BRANCH" origin/prod
 
-          if git merge upstream/main --no-edit; then
-            echo "conflicts=false" >> "$GITHUB_OUTPUT"
-          else
-            # Leave the conflict markers in the tree and commit them, so the
-            # resulting PR surfaces conflicts for a human instead of silently
-            # dropping either side.
+          # Merge without auto-committing so the tree can be normalised first.
+          git merge --no-commit --no-edit upstream/main || true
+
+          # The fork owns its CI. Force .github/workflows/ back to exactly the
+          # copy on prod: upstream's workflow edits are not wanted here, and a
+          # push authenticated with GITHUB_TOKEN is rejected outright if it
+          # changes anything under .github/workflows/**.
+          rm -rf .github/workflows
+          git checkout origin/prod -- .github/workflows
+
+          # Record real remaining conflicts (workflow ones are resolved above)
+          # before `git add` marks them resolved.
+          if [ -n "$(git ls-files --unmerged)" ]; then
             echo "conflicts=true" >> "$GITHUB_OUTPUT"
-            git add -A
-            git commit --no-verify -m "sync: merge upstream/main (UNRESOLVED CONFLICTS — resolve in this PR)"
+            commit_msg="sync: merge upstream/main (UNRESOLVED CONFLICTS — resolve in this PR)"
+          else
+            echo "conflicts=false" >> "$GITHUB_OUTPUT"
+            commit_msg="sync: merge upstream/main"
           fi
 
-          if git diff --quiet origin/prod HEAD; then
+          # Stage everything, including any remaining conflict markers, so the
+          # PR surfaces conflicts for a human instead of dropping either side.
+          git add -A
+
+          if git diff --cached --quiet; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "prod is already up to date with upstream/main — nothing to sync."
+            echo "Nothing to sync (workflow-only upstream changes are skipped by design)."
+            git merge --abort 2>/dev/null || true
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
+            git commit --no-verify -m "$commit_msg"
             git push origin HEAD
           fi
 

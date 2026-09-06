@@ -22,20 +22,33 @@ git fetch origin "$BASE_BRANCH"
 
 git checkout -b "$SYNC_BRANCH" "origin/${BASE_BRANCH}"
 
-if git merge upstream/main --no-edit; then
-  echo "✅ Clean merge."
-else
+git merge --no-commit --no-edit upstream/main || true
+
+# The fork owns its CI — keep .github/workflows/ exactly as on the base branch
+# (mirrors the CI workflow; a GITHUB_TOKEN push is refused if it touches
+# .github/workflows/**).
+rm -rf .github/workflows
+git checkout "origin/${BASE_BRANCH}" -- .github/workflows
+
+if [ -n "$(git ls-files --unmerged)" ]; then
   echo "⚠️  Merge conflicts — committing them as-is so they can be resolved in the PR."
-  git add -A
-  git commit --no-verify -m "sync: merge upstream/main (UNRESOLVED CONFLICTS — resolve in this PR)"
+  commit_msg="sync: merge upstream/main (UNRESOLVED CONFLICTS — resolve in this PR)"
+else
+  echo "✅ Clean merge."
+  commit_msg="sync: merge upstream/main"
 fi
 
-if git diff --quiet "origin/${BASE_BRANCH}" HEAD; then
-  echo "Nothing to sync — ${BASE_BRANCH} already matches upstream/main."
+git add -A
+
+if git diff --cached --quiet; then
+  echo "Nothing to sync — ${BASE_BRANCH} already matches upstream/main (workflow-only changes are skipped by design)."
+  git merge --abort 2>/dev/null || true
   git checkout -
   git branch -D "$SYNC_BRANCH"
   exit 0
 fi
+
+git commit --no-verify -m "$commit_msg"
 
 git push origin "$SYNC_BRANCH"
 
