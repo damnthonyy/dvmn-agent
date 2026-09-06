@@ -6,33 +6,71 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout prod
         uses: actions/checkout@v4
         with:
+          ref: prod
           fetch-depth: 0
 
       - name: Add upstream remote and fetch
         run: |
-          git remote add upstream https://github.com/The-PR-Agent/dvmn-agent.git || true
-          git fetch upstream --tags
+          git remote add upstream https://github.com/qodo-ai/pr-agent.git || true
+          git fetch upstream main --tags
 
-      - name: Create branch from upstream/main
+      - name: Merge upstream into a sync branch
+        id: merge
         env:
           BRANCH: sync/upstream-${{ github.run_id }}
         run: |
-          git checkout -b "$BRANCH" upstream/main
-          git push origin HEAD:refs/heads/"$BRANCH"
+          git config user.name  "sync-bot"
+          git config user.email "sync-bot@users.noreply.github.com"
 
-      - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v5
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          base: main
-          branch: sync/upstream-${{ github.run_id }}
-          title: "sync: bring changes from upstream/main (run ${{ github.run_id }})"
-          body: "auto-generated PR to sync with upstream/main. Please review and merge if everything looks good."
+          # Start from OUR code, not upstream's — this preserves the fork delta.
+          git checkout -b "$BRANCH" origin/prod
+
+          if git merge upstream/main --no-edit; then
+            echo "conflicts=false" >> "$GITHUB_OUTPUT"
+          else
+            # Leave the conflict markers in the tree and commit them, so the
+            # resulting PR surfaces conflicts for a human instead of silently
+            # dropping either side.
+            echo "conflicts=true" >> "$GITHUB_OUTPUT"
+            git add -A
+            git commit --no-verify -m "sync: merge upstream/main (UNRESOLVED CONFLICTS — resolve in this PR)"
+          fi
+
+          if git diff --quiet origin/prod HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "prod is already up to date with upstream/main — nothing to sync."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git push origin HEAD
+          fi
+
+      - name: Open pull request
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: sync/upstream-${{ github.run_id }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+        run: |
+          if [ "$CONFLICTS" = "true" ]; then
+            NOTE="⚠️ This merge produced **conflicts**. They are committed with conflict markers intact — resolve them in this PR before merging."
+          else
+            NOTE="Merge was clean."
+          fi
+
+          gh pr create \
+            --base prod \
+            --head "$BRANCH" \
+            --title "sync: bring changes from upstream/main (run ${{ github.run_id }})" \
+            --body "$(printf '%s\n\n%s\n' \
+              "Auto-generated PR to sync with \`upstream/main\` (qodo-ai/pr-agent). The branch starts from \`origin/prod\` and merges \`upstream/main\` on top, so the fork delta is preserved." \
+              "$NOTE")" \
+            || echo "A PR for $BRANCH may already exist."
