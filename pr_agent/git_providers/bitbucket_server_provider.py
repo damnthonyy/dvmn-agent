@@ -13,9 +13,8 @@ from ..algo.file_filter import filter_ignored
 from ..algo.git_patch_processing import decode_if_bytes
 from ..algo.language_handler import is_valid_file
 from ..algo.types import EDIT_TYPE, FilePatchInfo
-from ..algo.utils import (find_line_number_of_relevant_line_in_file,
-                          load_large_diff)
-from ..config_loader import get_settings
+from ..algo.utils import find_line_number_of_relevant_line_in_file, load_large_diff
+from ..config_loader import get_settings, get_verbosity_level
 from ..log import get_logger
 from .git_provider import GitProvider, get_git_ssl_env
 
@@ -112,8 +111,21 @@ class BitbucketServerProvider(GitProvider):
                 if e.response.status_code == 404:  # not found
                     return ""
 
-            get_logger().error(f"Failed to load .pr_agent.toml file, error: {e}")
+            # A missing .pr_agent.toml is an expected, optional case (like the other
+            # git providers), so don't report it as an error. Log at info level to keep
+            # visibility for genuinely unexpected failures without alarming users.
+            get_logger().info(f"Failed to load .pr_agent.toml file, error: {e}")
             return ""
+
+    def get_repo_file_content(self, file_path: str, from_default_branch: bool = False):
+        # Read from the PR target ref (the branch being merged into), matching the other providers,
+        # or from the repository default branch when from_default_branch is requested.
+        if from_default_branch:
+            default_branch_dict = self.bitbucket_client.get_default_branch(self.workspace_slug, self.repo_slug)
+            ref = default_branch_dict.get('displayId') or self.pr.toRef['latestCommit']
+        else:
+            ref = self.pr.toRef['latestCommit']
+        return self.get_file(file_path, ref)
 
     def get_pr_id(self):
         return self.pr_num
@@ -178,10 +190,9 @@ class BitbucketServerProvider(GitProvider):
             post_parameters_list.append(post_parameters)
 
         try:
-            self.publish_inline_comments(post_parameters_list)
-            return True
+            return self.publish_inline_comments(post_parameters_list)
         except Exception as e:
-            if get_settings().config.verbosity_level >= 2:
+            if get_verbosity_level() >= 2:
                 get_logger().error(f"Failed to publish code suggestion, error: {e}")
             return False
 
@@ -205,7 +216,10 @@ class BitbucketServerProvider(GitProvider):
                                                                      path,
                                                                      commit_id)
         except HTTPError as e:
-            get_logger().debug(f"File {path} not found at commit id: {commit_id}")
+            if getattr(getattr(e, "response", None), "status_code", None) == 404:
+                get_logger().debug(f"File {path} not found at commit id: {commit_id}")
+                return file_content
+            raise
         return file_content
 
     def get_files(self):
@@ -270,6 +284,7 @@ class BitbucketServerProvider(GitProvider):
                 get_logger().info(f"Skipping a non-code file: {file_path}")
                 continue
 
+            old_filename = None
             match change['type']:
                 case 'ADD':
                     edit_type = EDIT_TYPE.ADDED
@@ -281,8 +296,15 @@ class BitbucketServerProvider(GitProvider):
                     new_file_content_str = ""
                     original_file_content_str = self.get_file(file_path, base_sha)
                     original_file_content_str = decode_if_bytes(original_file_content_str)
-                case 'RENAME':
+                case 'MOVE' | 'RENAME':
                     edit_type = EDIT_TYPE.RENAMED
+                    source_path = change.get('srcPath') or {}
+                    original_file_path = source_path.get('toString', file_path)
+                    old_filename = original_file_path if original_file_path != file_path else None
+                    original_file_content_str = self.get_file(original_file_path, base_sha)
+                    original_file_content_str = decode_if_bytes(original_file_content_str)
+                    new_file_content_str = self.get_file(file_path, head_sha)
+                    new_file_content_str = decode_if_bytes(new_file_content_str)
                 case _:
                     edit_type = EDIT_TYPE.MODIFIED
                     original_file_content_str = self.get_file(file_path, base_sha)
@@ -299,6 +321,7 @@ class BitbucketServerProvider(GitProvider):
                     patch,
                     file_path,
                     edit_type=edit_type,
+                    old_filename=old_filename,
                 )
             )
 
@@ -330,7 +353,7 @@ class BitbucketServerProvider(GitProvider):
             absolute_position
         )
         if position == -1:
-            if get_settings().config.verbosity_level >= 2:
+            if get_verbosity_level() >= 2:
                 get_logger().info(f"Could not find position for {relevant_file} {relevant_line_in_file}")
             subject_type = "FILE"
         else:
@@ -338,7 +361,7 @@ class BitbucketServerProvider(GitProvider):
         path = relevant_file.strip()
         return dict(body=body, path=path, position=absolute_position) if subject_type == "LINE" else {}
 
-    def publish_inline_comment(self, comment: str, from_line: int, file: str, original_suggestion=None):
+    def publish_inline_comment(self, comment: str, from_line: int, file: str, original_suggestion=None) -> bool:
         payload = {
             "text": comment,
             "severity": "NORMAL",
@@ -355,7 +378,8 @@ class BitbucketServerProvider(GitProvider):
             self.bitbucket_client.post(self._get_pr_comments_path(), data=payload)
         except Exception as e:
             get_logger().error(f"Failed to publish inline comment to '{file}' at line {from_line}, error: {e}")
-            raise e
+            return False
+        return True
 
     def get_line_link(self, relevant_file: str, relevant_line_start: int, relevant_line_end: int = None) -> str:
         if relevant_line_start == -1:
@@ -380,32 +404,43 @@ class BitbucketServerProvider(GitProvider):
                     link = f"{self.pr_url}/diff#{quote_plus(relevant_file)}?t={absolute_position}"
                     return link
                 else:
-                    if get_settings().config.verbosity_level >= 2:
+                    if get_verbosity_level() >= 2:
                         get_logger().info(f"Failed adding line link to '{relevant_file}' since PR not set")
             else:
-                if get_settings().config.verbosity_level >= 2:
+                if get_verbosity_level() >= 2:
                     get_logger().info(f"Failed adding line link to '{relevant_file}' since position not found")
 
             if absolute_position != -1 and self.pr_url:
                 link = f"{self.pr_url}/diff#{quote_plus(relevant_file)}?t={absolute_position}"
                 return link
         except Exception as e:
-            if get_settings().config.verbosity_level >= 2:
+            if get_verbosity_level() >= 2:
                 get_logger().info(f"Failed adding line link to '{relevant_file}', error: {e}")
 
         return ""
 
-    def publish_inline_comments(self, comments: list[dict]):
+    def publish_inline_comments(self, comments: list[dict]) -> bool:
+        publishable_count = 0
+        published_count = 0
         for comment in comments:
             if 'position' in comment:
-                self.publish_inline_comment(comment['body'], comment['position'], comment['path'])
+                from_line = comment['position']
             elif 'start_line' in comment: # multi-line comment
                 # note that bitbucket does not seem to support range - only a comment on a single line - https://community.developer.atlassian.com/t/api-post-endpoint-for-inline-pull-request-comments/60452
-                self.publish_inline_comment(comment['body'], comment['start_line'], comment['path'])
+                from_line = comment['start_line']
             elif 'line' in comment: # single-line comment
-                self.publish_inline_comment(comment['body'], comment['line'], comment['path'])
+                from_line = comment['line']
             else:
                 get_logger().error(f"Could not publish inline comment: {comment}")
+                continue
+
+            publishable_count += 1
+            if self.publish_inline_comment(comment['body'], from_line, comment['path']):
+                published_count += 1
+
+        # A partial failure must not report failure: the caller republishes the whole
+        # list, which would post the already-accepted suggestions a second time.
+        return published_count > 0 or publishable_count == 0
 
     def get_title(self):
         return self.pr.title
@@ -434,7 +469,7 @@ class BitbucketServerProvider(GitProvider):
         )
 
     def add_eyes_reaction(self, issue_comment_id: int, disable_eyes: bool = False) -> Optional[int]:
-        return True
+        return None
 
     def remove_reaction(self, issue_comment_id: int, reaction_id: int) -> bool:
         return True
@@ -507,16 +542,22 @@ class BitbucketServerProvider(GitProvider):
     def _get_pr_file_content(self, remote_link: str):
         return ""
 
-    def get_commit_messages(self):
+    def get_commit_messages(self) -> str:
         return ""
 
     # bitbucket does not support labels
     def publish_description(self, pr_title: str, description: str):
+        pr = self.pr
+        if pr_title is None:
+            # Replace-style update: an omitted/stale title would be lost, so
+            # re-fetch to preserve a title edited during the describe run.
+            pr = self._get_pr()
+            self.pr = pr
         payload = {
-            "version": self.pr.version,
+            "version": pr.version,
             "description": description,
-            "title": pr_title,
-            "reviewers": self.pr.reviewers  # needs to be sent otherwise gets wiped
+            "title": pr_title if pr_title is not None else pr.title,
+            "reviewers": pr.reviewers  # needs to be sent otherwise gets wiped
         }
         try:
             self.bitbucket_client.update_pull_request(self.workspace_slug, self.repo_slug, str(self.pr_num), payload)
@@ -555,7 +596,7 @@ class BitbucketServerProvider(GitProvider):
         bearer_token = self.bearer_token
         if not bearer_token:
             #Shouldn't happen since this is checked in _prepare_clone, therefore - throwing an exception.
-            raise RuntimeError(f"Bearer token is required!")
+            raise RuntimeError("Bearer token is required!")
 
         cli_args = shlex.split(f"git clone -c http.extraHeader='Authorization: Bearer {bearer_token}' "
                                f"--filter=blob:none --depth 1 {repo_url} {dest_folder}")

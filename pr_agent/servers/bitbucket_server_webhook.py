@@ -1,4 +1,5 @@
 import ast
+import copy
 import json
 import os
 import re
@@ -13,14 +14,14 @@ from starlette.background import BackgroundTasks
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette_context import context
 from starlette_context.middleware import RawContextMiddleware
 
-from pr_agent.agent.pr_agent import PRAgent
-from pr_agent.algo.utils import update_settings_from_args
-from pr_agent.config_loader import get_settings
+from pr_agent.agent.pr_agent import PRAgent, prepare_command
+from pr_agent.config_loader import get_settings, global_settings
 from pr_agent.git_providers.utils import apply_repo_settings
 from pr_agent.log import LoggingFormat, get_logger, setup_logger
-from pr_agent.servers.utils import verify_signature
+from pr_agent.servers.utils import get_pr_commands, verify_signature
 
 setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
 router = APIRouter()
@@ -144,6 +145,11 @@ async def handle_webhook(background_tasks: BackgroundTasks, request: Request):
         signature_header = request.headers.get("x-hub-signature", None)
         verify_signature(body_bytes, webhook_secret, signature_header)
 
+    # Install a per-request settings clone only after auth/connection-test checks, so
+    # rejected traffic doesn't pay the deepcopy cost. Must precede apply_repo_settings(),
+    # which mutates get_settings() (context["settings"] when present).
+    context["settings"] = copy.deepcopy(global_settings)
+
     pr_id = data["pullRequest"]["id"]
     repository_name = data["pullRequest"]["toRef"]["repository"]["slug"]
     project_name = data["pullRequest"]["toRef"]["repository"]["project"]["key"]
@@ -155,11 +161,13 @@ async def handle_webhook(background_tasks: BackgroundTasks, request: Request):
 
     commands_to_run = []
 
+    # push event; -1 for push unassigned to a PR: Check auto commands for creation/updating
     if (data["eventKey"] == "pr:opened"
-            or (data["eventKey"] == "repo:refs_changed" and data.get("pullRequest", {}).get("id", -1) != -1)):  # push event; -1 for push unassigned to a PR: #Check auto commands for creation/updating
+            or (data["eventKey"] in ["pr:from_ref_updated", "repo:refs_changed"]
+                and data.get("pullRequest", {}).get("id", -1) != -1)):
         apply_repo_settings(pr_url)
         if not should_process_pr_logic(data):
-            get_logger().info(f"PR ignored due to config settings", **log_context)
+            get_logger().info("PR ignored due to config settings", **log_context)
             return JSONResponse(
                 status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "PR ignored by config"})
             )
@@ -170,8 +178,8 @@ async def handle_webhook(background_tasks: BackgroundTasks, request: Request):
             )
         get_settings().set("config.is_auto_command", True)
         if data["eventKey"] == "pr:opened":
-            commands_to_run.extend(_get_commands_list_from_settings('BITBUCKET_SERVER.PR_COMMANDS'))
-        else: #Has to be: data["eventKey"] == "pr:from_ref_updated"
+            commands_to_run.extend(get_pr_commands("bitbucket_server"))
+        else: # Has to be: data["eventKey"] == "pr:from_ref_updated" or "repo:refs_changed"
             if not get_settings().get("BITBUCKET_SERVER.HANDLE_PUSH_TRIGGER"):
                 get_logger().info(f"Push trigger is disabled, skipping push commands for PR {pr_url}", **log_context)
                 return JSONResponse(
@@ -218,17 +226,10 @@ async def _run_commands_sequentially(commands: List[str], url: str, log_context:
         except Exception as e:
             get_logger().error(f"Failed to handle command: {command} , error: {e}")
 
-def _process_command(command: str, url) -> str:
+def _process_command(command: str, url) -> list[str]:
     # don't think we need this
     apply_repo_settings(url)
-    # Process the command string
-    split_command = command.split(" ")
-    command = split_command[0]
-    args = split_command[1:]
-    # do I need this? if yes, shouldn't this be done in PRAgent?
-    other_args = update_settings_from_args(args)
-    new_command = ' '.join([command] + other_args)
-    return new_command
+    return prepare_command(command)
 
 
 def _to_list(command_string: str) -> list:
@@ -244,11 +245,12 @@ def _to_list(command_string: str) -> list:
         raise ValueError(f"Invalid command string: {e}")
 
 
-def _get_commands_list_from_settings(setting_key:str ) -> list:
+def _get_commands_list_from_settings(setting_key: str) -> list:
     try:
         return get_settings().get(setting_key, [])
     except ValueError as e:
         get_logger().error(f"Failed to get commands list from settings {setting_key}: {e}")
+        return []
 
 
 @router.get("/")
