@@ -87,12 +87,15 @@ jobs:
             "Auto-generated PR to sync with \`upstream/main\` (qodo-ai/pr-agent). The branch starts from \`origin/prod\` and merges \`upstream/main\` on top, so the fork delta is preserved." \
             "$NOTE")"
 
-          if gh pr create --base prod --head "$BRANCH" \
-               --title "sync: bring changes from upstream/main (run ${{ github.run_id }})" \
-               --body "$BODY"; then
+          # REST create (works with a fine-grained PAT that has Pull requests: write;
+          # gh pr create uses a GraphQL mutation that fine-grained PATs can't reach).
+          if gh api -X POST "repos/${{ github.repository }}/pulls" \
+               -f title="sync: bring changes from upstream/main (run ${{ github.run_id }})" \
+               -f head="$BRANCH" -f base="prod" -f body="$BODY" \
+               --jq '.html_url'; then
             echo "Pull request opened."
           else
-            echo "::warning::gh pr create failed (GITHUB_TOKEN cannot open PRs; add a SYNC_UPSTREAM_PAT secret). The sync branch is pushed — open the PR manually."
+            echo "::warning::PR creation failed (SYNC_UPSTREAM_PAT missing Pull requests: write?). The sync branch is pushed — open the PR manually."
             {
               echo "### Sync branch pushed"
               echo ""
