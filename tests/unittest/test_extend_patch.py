@@ -177,16 +177,16 @@ class TestLoadLargeDiff:
                                 old content 1
                                 old content 2""")
 
-        patch_expected="""\
----
-+++
-@@ -1,3 +1,3 @@
--
-                                 old content 1
--                                old content 2
-+                                some new content
-+                                another line
-"""
+        patch_expected = (
+            "--- \n"
+            "+++ \n"
+            "@@ -1,3 +1,3 @@\n"
+            "-\n"
+            "                                 old content 1\n"
+            "-                                old content 2\n"
+            "+                                some new content\n"
+            "+                                another line\n"
+        )
         assert patch == patch_expected
 
     def test_empty_inputs(self):
