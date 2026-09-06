@@ -1,0 +1,85 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin:0; background:#eef0f3; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif; }
+    a { color:#0969da; text-decoration:none; }
+    a:hover { color:#0757ba; text-decoration:underline; }
+    .chip { padding:.2em .4em; font-size:85%; background:rgba(129,139,152,.12); border-radius:6px; font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace; white-space:nowrap; color:#1f2328; }
+    .chip-dark { padding:.2em .4em; font-size:85%; background:rgba(101,108,133,.2); border-radius:6px; font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace; white-space:nowrap; color:#f0f6fc; }
+    .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    .cap { font-size:11px; font-weight:600; letter-spacing:0.08em; text-transform:uppercase; color:#6b7280; }
+  </style>
+</helmet>
+
+<div style="display:flex; flex-direction:column; gap:32px; padding:48px 48px 56px;">
+
+  <div style="display:flex; flex-direction:column; gap:6px;">
+    <div class="cap">Artboard A · the label system</div>
+    <div style="font-size:24px; font-weight:600; color:#111827; letter-spacing:-0.01em;">Labels, not a table row</div>
+    <div style="font-size:14px; line-height:1.55; color:#6b7280; max-width:680px;">Every label is an inline <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px;">&lt;code&gt;</span> span. GitHub renders those as grey pills on its own — no CSS, no images, and they survive dark mode.</div>
+  </div>
+
+  <div style="background:#ffffff; border:1px solid #d1d9e0; border-radius:6px; padding:20px; display:flex; flex-direction:column; gap:20px; font-size:16px; line-height:1.5; color:#1f2328;">
+    <div style="display:flex; flex-direction:column; gap:10px;">
+      <div class="cap">Change type — one or more</div>
+      <div class="row">
+        <code class="chip">✨ Enhancement</code>
+        <code class="chip">🐛 Bug fix</code>
+        <code class="chip">🧪 Tests</code>
+        <code class="chip">📝 Documentation</code>
+        <code class="chip">♻️ Refactor</code>
+        <code class="chip">🔧 Configuration</code>
+        <code class="chip">📦 Dependencies</code>
+        <code class="chip">🔒 Security</code>
+      </div>
+    </div>
+
+    <div style="display:flex; flex-direction:column; gap:10px;">
+      <div class="cap">Review effort — exactly one</div>
+      <div class="row">
+        <code class="chip">🕐 &lt;20 Minutes</code>
+        <code class="chip">🕐 20-40 Minutes</code>
+        <code class="chip">🕐 40+ Minutes</code>
+      </div>
+    </div>
+
+    <div style="display:flex; flex-direction:column; gap:10px;">
+      <div class="cap">Flags — only when true</div>
+      <div class="row">
+        <code class="chip">🚩 Breaking change</code>
+        <code class="chip">🗄️ Migration</code>
+      </div>
+      <div style="font-size:13px; line-height:1.55; color:#6b7280;">These two change what a reviewer does, so they get a label. Nothing else does — a label per attribute turns the row back into a table.</div>
+    </div>
+  </div>
+
+  <div style="display:flex; flex-direction:column; gap:10px;">
+    <div class="cap">What the tool emits</div>
+    <div style="background:#f6f8fa; border:1px solid #d1d9e0; border-radius:6px; padding:14px 16px; font-family:ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace; font-size:13px; line-height:1.7; color:#1f2328; white-space:pre-wrap;">`✨ Enhancement` `🐛 Bug fix` `🧪 Tests` `🕐 20-40 Minutes`</div>
+    <div style="font-size:13px; line-height:1.55; color:#6b7280; max-width:660px;">One line of Markdown. No table, no HTML, no shields.io round-trip — which also means the labels render in e-mail notifications and in the GitHub mobile app.</div>
+  </div>
+
+  <div style="display:flex; flex-direction:column; gap:10px;">
+    <div class="cap">Dark theme</div>
+    <div style="background:#0d1117; border:1px solid #3d444d; border-radius:6px; padding:20px; font-size:16px; line-height:1.5; color:#f0f6fc;">
+      <div style="margin-bottom:14px;">Serialise webhook deliveries per repository so concurrent pushes stop overwriting each other.</div>
+      <div class="row">
+        <code class="chip-dark">✨ Enhancement</code>
+        <code class="chip-dark">🐛 Bug fix</code>
+        <code class="chip-dark">🧪 Tests</code>
+        <code class="chip-dark">🕐 20-40 Minutes</code>
+      </div>
+    </div>
+  </div>
+
+</div>
+</x-dc>
+</body>
+</html>

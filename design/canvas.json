@@ -1,0 +1,25 @@
+{
+  "artboards": [
+    { "file": "Labels.dc.html", "x": 0, "y": 0, "w": 880, "h": 1080, "title": "A · Labels" },
+    { "file": "Main.dc.html", "x": 960, "y": 0, "w": 880, "h": 1180, "title": "B · Full description" },
+    { "file": "Mechanical.dc.html", "x": 0, "y": 1300, "w": 880, "h": 900, "title": "C · Light PR" },
+    { "file": "BeforeAfter.dc.html", "x": 960, "y": 1300, "w": 1520, "h": 1420, "title": "D · Before / after" }
+  ],
+  "annotations": [
+    {
+      "id": "structure",
+      "x": -350,
+      "y": 0,
+      "w": 290,
+      "text": "Section order, always the same:\n\n1. Summary line + labels\n2. Description\n3. Which issue(s)\n4. PR acceptance criteria\n5. How to test changes\n6. Special notes to the reviewer\n\nOnly presence varies. A section with nothing to say is dropped, never filled with N/A."
+    },
+    {
+      "id": "no-tables",
+      "x": -350,
+      "y": 1300,
+      "w": 290,
+      "text": "No tables anywhere.\n\nThe labels are inline code spans, the sections are <details>. Both are plain Markdown, so they also render in e-mail notifications and the GitHub mobile app — which nested HTML tables do not."
+    }
+  ],
+  "launch": { "view": "canvas" }
+}

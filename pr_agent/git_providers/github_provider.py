@@ -729,7 +729,8 @@ class GithubProvider(GitProvider):
 query($owner:String!, $name:String!, $number:Int!) {
   repository(owner:$owner, name:$name) {
     pullRequest(number:$number) {
-      closingIssuesReferences(first:20) {
+      closingIssuesReferences(first:100) {
+        pageInfo { hasNextPage }
         nodes { number title url state }
       }
     }
@@ -750,10 +751,14 @@ query($owner:String!, $name:String!, $number:Int!) {
                 get_logger().warning("Failed to resolve linked issues",
                                      artifact={"errors": (data or {}).get("errors")})
                 return []
-            nodes = (((data.get("data") or {}).get("repository") or {}).get("pullRequest") or {}) \
-                .get("closingIssuesReferences", {}).get("nodes")
+            refs = ((((data.get("data") or {}).get("repository") or {}).get("pullRequest") or {})
+                    .get("closingIssuesReferences") or {})
+            nodes = refs.get("nodes")
             if not nodes:
                 return []
+            if (refs.get("pageInfo") or {}).get("hasNextPage"):
+                get_logger().warning(f"PR has more than 100 linked issues, only the first 100 are used, "
+                                     f"pr: {self.pr_num}")
             issues = []
             for node in nodes:
                 if not isinstance(node, dict) or not node.get("number"):

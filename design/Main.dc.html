@@ -1,0 +1,99 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin:0; background:#eef0f3; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif; }
+    a { color:#0969da; text-decoration:none; }
+    a:hover { color:#0757ba; text-decoration:underline; }
+    .gh { color:#1f2328; font-size:16px; line-height:1.5; }
+    .gh h2 { font-size:1.5em; font-weight:600; margin:0 0 16px; padding-bottom:.3em; border-bottom:1px solid #d1d9e0; line-height:1.25; }
+    .gh p { margin:0 0 16px; }
+    .gh p:last-child { margin-bottom:0; }
+    .gh code { padding:.2em .4em; font-size:85%; background:rgba(129,139,152,.12); border-radius:6px; font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace; white-space:nowrap; }
+    .gh details { margin:0 0 8px; border-top:1px solid #d1d9e0; padding-top:8px; }
+    .gh summary { cursor:pointer; font-weight:600; padding:2px 0; }
+    .gh ul, .gh ol { padding-left:2em; margin:12px 0 4px; }
+    .gh li { margin:4px 0; }
+    .gh .task { list-style:none; padding-left:0; }
+    .gh .task li:before { content:"☐  "; color:#59636e; }
+  </style>
+</helmet>
+
+<div style="display:flex; flex-direction:column; gap:28px; padding:48px 48px 56px;">
+
+  <div style="display:flex; flex-direction:column; gap:6px;">
+    <div style="font-size:11px; font-weight:600; letter-spacing:0.08em; text-transform:uppercase; color:#6b7280;">Artboard B · the target output</div>
+    <div style="font-size:24px; font-weight:600; color:#111827; letter-spacing:-0.01em;">Full description — every section earns its place</div>
+    <div style="font-size:14px; line-height:1.55; color:#6b7280; max-width:680px;">Headline, one sentence, labels. Everything else folds away. A reviewer decides whether to open a section, instead of scrolling past it.</div>
+  </div>
+
+  <div style="background:#ffffff; border:1px solid #d1d9e0; border-radius:6px; overflow:hidden;">
+    <div style="background:#f6f8fa; border-bottom:1px solid #d1d9e0; padding:10px 16px; font-size:12px; color:#59636e;">
+      <strong style="color:#1f2328; font-weight:600;">dvmn-agent</strong> <span style="border:1px solid #d1d9e0; border-radius:2em; padding:0 6px; font-size:11px;">Bot</span> commented just now
+    </div>
+
+    <div class="gh" style="padding:16px;">
+      <h2>PR Summary</h2>
+      <p>Serialise webhook deliveries per repository so concurrent pushes stop overwriting each other.</p>
+      <p style="display:flex; flex-wrap:wrap; gap:8px;">
+        <code>✨ Enhancement</code>
+        <code>🐛 Bug fix</code>
+        <code>🧪 Tests</code>
+        <code>🕐 20-40 Minutes</code>
+      </p>
+
+      <details open>
+        <summary>Description</summary>
+        <p style="margin:12px 0 16px;">Concurrent deliveries for the same repository overwrote each other's processing state: two pushes seconds apart produced a single comment, the other silently lost. Processing is now serialised per repository, behind a lock held for the duration of the handler.</p>
+        <p style="margin:0 0 4px;">The trade-off is added latency on busy repositories — two simultaneous deliveries for the same repo now wait instead of racing.</p>
+      </details>
+
+      <details>
+        <summary>Which issue(s)</summary>
+        <ul>
+          <li>Closes <a href="#">#128</a> — duplicate pushes produce a single review comment</li>
+          <li>Related to <a href="#">#96</a> — the dropped delivery was first seen in the activity log</li>
+        </ul>
+      </details>
+
+      <details>
+        <summary>PR acceptance criteria</summary>
+        <ul class="task">
+          <li>Two pushes within one second on the same repository produce two comments</li>
+          <li>Deliveries for different repositories still run in parallel</li>
+          <li>A handler exception releases the lock</li>
+          <li>Lock wait time is logged</li>
+        </ul>
+      </details>
+
+      <details>
+        <summary>How to test changes</summary>
+        <ol>
+          <li><code>docker compose up</code></li>
+          <li>Push twice within a second to a connected sandbox repository</li>
+          <li><code>GET /api/dashboard/activity</code> — both deliveries appear, both <code>completed</code></li>
+        </ol>
+      </details>
+
+      <details>
+        <summary>Special notes to the reviewer</summary>
+        <ul>
+          <li>The lock is per repository, not global. Two repositories still run in parallel — if global serialisation was intended, this is not it.</li>
+          <li><code>retry_after</code> moves from 5s to 30s by default. Callers relying on fast retries will back off six times longer.</li>
+        </ul>
+      </details>
+    </div>
+  </div>
+
+  <div style="font-size:13px; line-height:1.6; color:#6b7280; max-width:700px;">Only <strong style="color:#111827; font-weight:600;">Description</strong> is open by default. The reviewer sees five section names and one paragraph — roughly twelve lines — and opens what they need. Worth confirming: acceptance criteria may deserve to be open too, since reviewers tick them.</div>
+
+</div>
+</x-dc>
+</body>
+</html>
