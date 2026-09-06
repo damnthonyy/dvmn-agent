@@ -5,19 +5,13 @@ enable_auto_approval = true
 [github_app]
 pr_commands = [
     "/describe --pr_description.publish_description_as_comment=true",
-    "/improve",
-    "/agentic_review"
+    "/improve"
 ]
 
 handle_push_trigger = true
 push_commands = [
-    "/improve",
-    "/agentic_review"
+    "/improve"
 ]
-
-[review_agent]
-enabled = true
-publish_output = true
 
 
 [openai]

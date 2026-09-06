@@ -181,11 +181,11 @@ class TestLoadLargeDiff:
             "--- \n"
             "+++ \n"
             "@@ -1,3 +1,3 @@\n"
-            "+\n"
+            "-\n"
             "                                 old content 1\n"
-            "-                                some new content\n"
-            "-                                another line\n"
-            "+                                old content 2\n"
+            "-                                old content 2\n"
+            "+                                some new content\n"
+            "+                                another line\n"
         )
         assert patch == patch_expected
 

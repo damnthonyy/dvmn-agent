@@ -46,6 +46,22 @@ command2class = {
 commands = list(command2class.keys())
 
 
+def unknown_auto_commands(command_list) -> list:
+    """Return the command names in `command_list` that have no handler in `command2class`.
+
+    Each item looks like ``"/improve --some.arg=1"``; only the leading token is a
+    command. Used to validate ``github_app.pr_commands`` / ``push_commands`` before
+    they are run, so a typo or a removed command surfaces loudly instead of a
+    silent per-request warning.
+    """
+    unknown = []
+    for command in command_list or []:
+        action = str(command).split(" ", 1)[0].strip().lstrip("/").lower()
+        if action and action not in command2class:
+            unknown.append(action)
+    return unknown
+
+
 
 class PRAgent:
     def __init__(self, ai_handler: partial[BaseAiHandler,] = LiteLLMAIHandler):
