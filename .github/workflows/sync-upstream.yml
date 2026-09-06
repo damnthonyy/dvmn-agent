@@ -68,6 +68,22 @@ jobs:
             git push origin HEAD
           fi
 
+      - name: Debug SYNC_UPSTREAM_PAT capabilities
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_UPSTREAM_PAT }}
+        run: |
+          echo "PAT present: $([ -n "$GH_TOKEN" ] && echo yes || echo NO)"
+          echo "--- x-oauth-scopes (empty => fine-grained PAT) ---"
+          curl -sI -H "Authorization: token $GH_TOKEN" https://api.github.com \
+            | grep -i "x-oauth-scopes:\|x-accepted-oauth-scopes:\|github-authentication-token-expiration:" || true
+          echo "--- whoami ---"
+          gh api user --jq '.login' || echo "  FAILED: cannot read /user"
+          echo "--- repo permissions this token has ---"
+          gh api "repos/${{ github.repository }}" --jq '.permissions' || echo "  FAILED: cannot read repo"
+          echo "--- can it read pulls? ---"
+          gh api "repos/${{ github.repository }}/pulls?per_page=1" --jq 'length' || echo "  FAILED: cannot list pulls"
+
       - name: Open pull request
         if: steps.merge.outputs.changed == 'true'
         env:
