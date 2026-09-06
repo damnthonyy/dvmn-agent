@@ -13,7 +13,7 @@ from starlette.middleware import Middleware
 from starlette_context import context
 from starlette_context.middleware import RawContextMiddleware
 
-from pr_agent.agent.pr_agent import PRAgent
+from pr_agent.agent.pr_agent import PRAgent, command2class, unknown_auto_commands
 from pr_agent.algo.utils import update_settings_from_args
 from pr_agent.config_loader import get_settings, global_settings
 from pr_agent.git_providers import (get_git_provider,
@@ -431,6 +431,12 @@ async def _perform_auto_commands_github(commands_conf: str, agent: PRAgent, body
     if not commands:
         get_logger().info(f"New PR, but no auto commands configured")
         return
+    unknown = unknown_auto_commands(commands)
+    if unknown:
+        get_logger().error(
+            f"github_app.{commands_conf} references unknown command(s) {unknown}; they will be skipped. "
+            f"Fix the configuration — known commands: {sorted(command2class.keys())}"
+        )
     get_settings().set("config.is_auto_command", True)
     for command in commands:
         split_command = command.split(" ")
