@@ -6,33 +6,101 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout prod
         uses: actions/checkout@v4
         with:
+          ref: prod
           fetch-depth: 0
 
       - name: Add upstream remote and fetch
         run: |
-          git remote add upstream https://github.com/The-PR-Agent/dvmn-agent.git || true
-          git fetch upstream --tags
+          git remote add upstream https://github.com/qodo-ai/pr-agent.git || true
+          git fetch upstream main --tags
 
-      - name: Create branch from upstream/main
+      - name: Merge upstream into a sync branch
+        id: merge
         env:
           BRANCH: sync/upstream-${{ github.run_id }}
         run: |
-          git checkout -b "$BRANCH" upstream/main
-          git push origin HEAD:refs/heads/"$BRANCH"
+          git config user.name  "sync-bot"
+          git config user.email "sync-bot@users.noreply.github.com"
 
-      - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v5
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          base: main
-          branch: sync/upstream-${{ github.run_id }}
-          title: "sync: bring changes from upstream/main (run ${{ github.run_id }})"
-          body: "auto-generated PR to sync with upstream/main. Please review and merge if everything looks good."
+          # Start from OUR code, not upstream's — this preserves the fork delta.
+          git checkout -b "$BRANCH" origin/prod
+
+          # Merge without auto-committing so the tree can be normalised first.
+          git merge --no-commit --no-edit upstream/main || true
+
+          # The fork owns its CI. Force .github/workflows/ back to exactly the
+          # copy on prod: upstream's workflow edits are not wanted here, and a
+          # push authenticated with GITHUB_TOKEN is rejected outright if it
+          # changes anything under .github/workflows/**.
+          rm -rf .github/workflows
+          git checkout origin/prod -- .github/workflows
+
+          # Record real remaining conflicts (workflow ones are resolved above)
+          # before `git add` marks them resolved.
+          if [ -n "$(git ls-files --unmerged)" ]; then
+            echo "conflicts=true" >> "$GITHUB_OUTPUT"
+            commit_msg="sync: merge upstream/main (UNRESOLVED CONFLICTS — resolve in this PR)"
+          else
+            echo "conflicts=false" >> "$GITHUB_OUTPUT"
+            commit_msg="sync: merge upstream/main"
+          fi
+
+          # Stage everything, including any remaining conflict markers, so the
+          # PR surfaces conflicts for a human instead of dropping either side.
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing to sync (workflow-only upstream changes are skipped by design)."
+            git merge --abort 2>/dev/null || true
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git commit --no-verify -m "$commit_msg"
+            git push origin HEAD
+          fi
+
+      - name: Open pull request
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          # GITHUB_TOKEN cannot open a PR here, so prefer a PAT
+          # (repo scope, Pull requests: read/write) and fall back to it.
+          GH_TOKEN: ${{ secrets.SYNC_UPSTREAM_PAT || secrets.GITHUB_TOKEN }}
+          BRANCH: sync/upstream-${{ github.run_id }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+        run: |
+          if [ "$CONFLICTS" = "true" ]; then
+            NOTE="⚠️ This merge produced **conflicts**. They are committed with conflict markers intact — resolve them in this PR before merging."
+          else
+            NOTE="Merge was clean."
+          fi
+
+          BODY="$(printf '%s\n\n%s\n' \
+            "Auto-generated PR to sync with \`upstream/main\` (qodo-ai/pr-agent). The branch starts from \`origin/prod\` and merges \`upstream/main\` on top, so the fork delta is preserved." \
+            "$NOTE")"
+
+          # REST create (works with a fine-grained PAT that has Pull requests: write;
+          # gh pr create uses a GraphQL mutation that fine-grained PATs can't reach).
+          if gh api -X POST "repos/${{ github.repository }}/pulls" \
+               -f title="sync: bring changes from upstream/main (run ${{ github.run_id }})" \
+               -f head="$BRANCH" -f base="prod" -f body="$BODY" \
+               --jq '.html_url'; then
+            echo "Pull request opened."
+          else
+            echo "::warning::PR creation failed (SYNC_UPSTREAM_PAT missing Pull requests: write?). The sync branch is pushed — open the PR manually."
+            {
+              echo "### Sync branch pushed"
+              echo ""
+              echo "[Open the pull request \`$BRANCH\` → \`prod\`](https://github.com/${{ github.repository }}/compare/prod...$BRANCH?expand=1)"
+              echo ""
+              echo "$NOTE"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
