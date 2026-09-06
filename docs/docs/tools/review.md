@@ -72,7 +72,7 @@ extra_instructions = "..."
       </tr>
       <tr>
         <td><b>num_max_findings</b></td>
-        <td>Number of maximum returned findings. Default is 3.</td>
+        <td>Number of maximum returned findings. Default is 8. Findings are ordered by severity, so the cap never drops a critical or high severity issue.</td>
       </tr>
     </table>
 
