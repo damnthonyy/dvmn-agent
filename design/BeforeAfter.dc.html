@@ -1,0 +1,157 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin:0; background:#eef0f3; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif; }
+    a { color:#0969da; text-decoration:none; }
+    a:hover { color:#0757ba; text-decoration:underline; }
+    .gh { color:#1f2328; font-size:14px; line-height:1.5; }
+    .gh code { padding:.2em .4em; font-size:88%; background:rgba(129,139,152,.12); border-radius:6px; font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace; white-space:nowrap; }
+    .gh details { margin:0 0 8px; border-top:1px solid #d1d9e0; padding-top:8px; }
+    .gh summary { cursor:pointer; font-weight:600; padding:2px 0; }
+    .gh ul { padding-left:1.8em; margin:10px 0 4px; }
+    .gh li { margin:4px 0; }
+    .sect { font-size:1.05em; font-weight:600; margin:0 0 10px; }
+    .cap { font-size:11px; font-weight:600; letter-spacing:0.08em; text-transform:uppercase; }
+  </style>
+</helmet>
+
+<div style="display:flex; flex-direction:column; gap:28px; padding:48px 48px 56px;">
+
+  <div style="display:flex; flex-direction:column; gap:6px;">
+    <div class="cap" style="color:#6b7280;">Artboard D · before / after</div>
+    <div style="font-size:24px; font-weight:600; color:#111827; letter-spacing:-0.01em;">The same pull request, both ways</div>
+    <div style="font-size:14px; line-height:1.55; color:#6b7280; max-width:780px;">Left: what <code style="padding:.15em .35em; font-size:90%; background:rgba(129,139,152,.12); border-radius:6px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">/describe</code> actually produced on sandbox PR #1. Right: the same PR under the new structure, sections folded. Both columns at the same scale.</div>
+  </div>
+
+  <div style="display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:40px; align-items:start;">
+
+    <!-- BEFORE -->
+    <div style="display:flex; flex-direction:column; gap:12px;">
+      <div style="display:flex; align-items:baseline; gap:10px;">
+        <div class="cap" style="color:oklch(0.52 0.14 25);">Before</div>
+        <div style="font-size:13px; color:#6b7280;">3888 characters · 5 sections, none foldable except the walkthrough</div>
+      </div>
+
+      <div class="gh" style="background:#ffffff; border:1px solid #d1d9e0; border-radius:6px; padding:14px;">
+        <div class="sect">PR Type</div>
+        <div style="margin:0 0 14px;">Enhancement, Tests</div>
+        <hr style="height:.25em; padding:0; margin:14px 0; background:#d1d9e0; border:0;">
+        <div class="sect">Summary</div>
+        <ul style="color:#59636e;">
+          <li>Add <code>ecris top</code> CLI command</li>
+          <li>Filter ranked results by tags</li>
+          <li>Add author and tag aggregations</li>
+          <li>Cover tag filters with tests</li>
+        </ul>
+        <hr style="height:.25em; padding:0; margin:14px 0; background:#d1d9e0; border:0;">
+        <div class="sect">Diagram Walkthrough</div>
+        <div style="border:1px solid #d1d9e0; border-radius:6px; padding:10px; margin:0 0 14px;">
+          <svg viewBox="0 0 420 120" width="100%" style="display:block;" role="img" aria-label="Diagram restating the import graph">
+            <g>
+              <rect x="6" y="46" width="86" height="30" rx="4" fill="#ECECFF" stroke="#9370DB"></rect>
+              <rect x="140" y="46" width="96" height="30" rx="4" fill="#ECECFF" stroke="#9370DB"></rect>
+              <rect x="286" y="10" width="128" height="30" rx="4" fill="#ECECFF" stroke="#9370DB"></rect>
+              <rect x="286" y="82" width="128" height="30" rx="4" fill="#ECECFF" stroke="#9370DB"></rect>
+            </g>
+            <g stroke="#333" stroke-width="1.2" fill="none">
+              <path d="M 92 61 L 138 61"></path>
+              <path d="M 236 55 L 284 34"></path>
+              <path d="M 236 68 L 284 92"></path>
+            </g>
+            <g font-family="'Trebuchet MS', Verdana, Arial, sans-serif" font-size="10" fill="#333" text-anchor="middle">
+              <text x="49" y="65">CLI top</text>
+              <text x="188" y="65">filters</text>
+              <text x="350" y="29">top_authors</text>
+              <text x="350" y="101">tag_histogram</text>
+            </g>
+          </svg>
+        </div>
+        <hr style="height:.25em; padding:0; margin:14px 0; background:#d1d9e0; border:0;">
+        <div class="sect">Notes for Reviewer</div>
+        <ul>
+          <li>Verify <code>top_authors</code> slicing: <code>ranked[:limit - 1]</code></li>
+          <li>Verify <code>filter_by_tags</code> duplicates on multi-tag match</li>
+          <li>Mutable default argument (<code>tags=[]</code>)</li>
+          <li><code>recent</code> silently swallows all exceptions</li>
+        </ul>
+        <hr style="height:.25em; padding:0; margin:14px 0; background:#d1d9e0; border:0;">
+        <div class="sect">File Walkthrough</div>
+        <div style="border:1px solid #d1d9e0; border-radius:6px; overflow:hidden;">
+          <div style="background:#f6f8fa; border-bottom:1px solid #d1d9e0; padding:6px 10px; font-size:12px; color:#59636e;">Relevant files</div>
+          <div style="padding:10px; display:flex; flex-direction:column; gap:8px;">
+            <div style="border:1px solid #d1d9e0; border-radius:4px; padding:8px 10px; font-size:12.5px; color:#59636e;"><strong style="color:#1f2328; font-weight:600;">cli.py</strong> · Add <code>top</code> subcommand and options<div style="margin-top:5px; color:#8b949e;">4 nested bullets · +20/-0 link</div></div>
+            <div style="border:1px solid #d1d9e0; border-radius:4px; padding:8px 10px; font-size:12.5px; color:#59636e;"><strong style="color:#1f2328; font-weight:600;">filters.py</strong> · Introduce filtering and aggregation helpers<div style="margin-top:5px; color:#8b949e;">4 nested bullets · +60/-0 link</div></div>
+            <div style="border:1px solid #d1d9e0; border-radius:4px; padding:8px 10px; font-size:12.5px; color:#59636e;"><strong style="color:#1f2328; font-weight:600;">test_filters.py</strong> · Add tests for tag-based helpers<div style="margin-top:5px; color:#8b949e;">4 nested bullets · +28/-0 link</div></div>
+          </div>
+        </div>
+      </div>
+
+      <div style="display:flex; flex-direction:column; gap:8px; border-left:2px solid oklch(0.52 0.14 25); padding-left:14px; font-size:13px; line-height:1.55; color:#4b5563;">
+        <div><strong style="font-weight:600; color:#111827;">Nested tables carry the layout</strong> — the walkthrough is a table inside a table, padded with <code style="padding:.1em .3em; font-size:90%; background:rgba(129,139,152,.12); border-radius:6px; font-family:ui-monospace,Menlo,monospace;">&amp;nbsp;</code> runs to fake columns.</div>
+        <div><strong style="font-weight:600; color:#111827;">Everything is open at once.</strong> The reader scrolls the whole thing whether or not any of it is relevant.</div>
+        <div><strong style="font-weight:600; color:#111827;">No issue link, no acceptance criteria, no test steps</strong> — the three things a reviewer normally looks for first are simply not asked for.</div>
+      </div>
+    </div>
+
+    <!-- AFTER -->
+    <div style="display:flex; flex-direction:column; gap:12px;">
+      <div style="display:flex; align-items:baseline; gap:10px;">
+        <div class="cap" style="color:oklch(0.52 0.14 165);">After</div>
+        <div style="font-size:13px; color:#6b7280;">~14 lines visible · 5 sections, foldable</div>
+      </div>
+
+      <div class="gh" style="background:#ffffff; border:1px solid #d1d9e0; border-radius:6px; padding:14px;">
+        <div style="font-size:1.35em; font-weight:600; margin:0 0 12px; padding-bottom:.3em; border-bottom:1px solid #d1d9e0;">PR Summary</div>
+        <div style="margin:0 0 14px;">Add an <code>ecris top</code> command that ranks feed authors, with optional tag filtering and a tag histogram.</div>
+        <div style="display:flex; flex-wrap:wrap; gap:8px; margin:0 0 16px;">
+          <code>✨ Enhancement</code>
+          <code>🧪 Tests</code>
+          <code>🕐 20-40 Minutes</code>
+        </div>
+
+        <details open>
+          <summary>Description</summary>
+          <div style="margin:12px 0 4px;">The ranking helpers live in a separate <code>filters</code> module rather than inside <code>cli.py</code>, so they stay testable without going through argument parsing. The CLI layer only parses flags and prints.</div>
+        </details>
+
+        <details>
+          <summary>Which issue(s)</summary>
+          <ul><li>No linked issue.</li></ul>
+        </details>
+
+        <details>
+          <summary>PR acceptance criteria</summary>
+          <ul><li>Four criteria</li></ul>
+        </details>
+
+        <details>
+          <summary>How to test changes</summary>
+          <ul><li>Three steps</li></ul>
+        </details>
+
+        <details>
+          <summary>Special notes to the reviewer</summary>
+          <ul><li>Four notes</li></ul>
+        </details>
+      </div>
+
+      <div style="display:flex; flex-direction:column; gap:8px; border-left:2px solid oklch(0.52 0.14 165); padding-left:14px; font-size:13px; line-height:1.55; color:#4b5563;">
+        <div><strong style="font-weight:600; color:#111827;">No tables at all.</strong> Headings, paragraphs, lists and <code style="padding:.1em .3em; font-size:90%; background:rgba(129,139,152,.12); border-radius:6px; font-family:ui-monospace,Menlo,monospace;">&lt;details&gt;</code> — every section stands on its own.</div>
+        <div><strong style="font-weight:600; color:#111827;">The reader chooses the depth.</strong> Five names and one paragraph; the rest opens on demand.</div>
+        <div><strong style="font-weight:600; color:#111827;">The labels replace the PR Type block</strong> — one line instead of a section.</div>
+      </div>
+    </div>
+
+  </div>
+
+</div>
+</x-dc>
+</body>
+</html>

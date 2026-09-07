@@ -3,7 +3,7 @@ import os
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from pr_agent.algo.types import FilePatchInfo
 from pr_agent.algo.utils import Range, process_description
@@ -215,6 +215,20 @@ class GitProvider(ABC):
             if max_tokens_description:
                 description = clip_tokens(description, max_tokens_description)
             return description
+
+    def get_linked_issues(self) -> List[dict]:
+        """Issues this PR will close, as the forge itself resolves them.
+
+        Distinct from parsing the description or the branch name: a provider that
+        implements this reports links made outside the PR body too — GitHub's
+        Development sidebar, for instance — which no parser can see.
+
+        Returns a list of ``{"number", "title", "url", "state"}``. The default is
+        an empty list, meaning "this provider cannot answer", not "no issue is
+        linked": callers fall back to extract_tickets() rather than rendering
+        "no linked issue" off the back of it.
+        """
+        return []
 
     def get_user_description(self) -> str:
         if hasattr(self, 'user_description') and not (self.user_description is None):
