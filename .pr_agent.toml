@@ -1,6 +1,12 @@
+# NOTE: This file is consumed by Qodo's "free for open source" agent
+# (the `qodo-free-for-open-source-projects` bot) — a separate, hosted, closed-source
+# service. It is NOT read by the open-source pr-agent in this repository; some keys
+# below (e.g. the [review_agent] section) only exist in that hosted agent.
+
 [pr_reviewer]
 enable_review_labels_effort = true
 enable_auto_approval = true
+persistent_finding_state = true
 
 [github_app]
 pr_commands = [
@@ -13,7 +19,15 @@ push_commands = [
     "/improve"
 ]
 
+<<<<<<< HEAD
 
 [openai]
 api_base = "http://localhost:8787/v1" ## proxy for headroom token compressor ( https://github.com/chopratejas/headroom )
 key = "sk-xxxxxx"
+=======
+[review_agent]
+enabled = true
+publish_output = true
+demand_self_review = true
+approve_pr_on_self_review = true
+>>>>>>> upstream/main

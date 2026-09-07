@@ -37,7 +37,11 @@ some_config2=...
 ```
     """
 
+<<<<<<< HEAD
         output += f"\n\nSee the review [usage page](https://dvmn-agent-docs.codium.ai/tools/review/) for a comprehensive guide on using this tool.\n\n"
+=======
+        output += "\n\nSee the review [usage page](https://pr-agent-docs.codium.ai/tools/review/) for a comprehensive guide on using this tool.\n\n"
+>>>>>>> upstream/main
 
         return output
 
@@ -134,7 +138,11 @@ Use triple quotes to write multi-line instructions. Use bullet points to make th
 
         output += "</table>"
 
+<<<<<<< HEAD
         output += f"\n\nSee the [describe usage](https://dvmn-agent-docs.codium.ai/tools/describe/) page for a comprehensive guide on using this tool.\n\n"
+=======
+        output += "\n\nSee the [describe usage](https://pr-agent-docs.codium.ai/tools/describe/) page for a comprehensive guide on using this tool.\n\n"
+>>>>>>> upstream/main
 
         return output
 
@@ -160,7 +168,11 @@ You can ask questions about the entire PR, about specific code lines, or about a
         #
         # output += "</table>"
 
+<<<<<<< HEAD
         output += f"\n\nSee the [ask usage](https://dvmn-agent-docs.codium.ai/tools/ask/) page for a comprehensive guide on using this tool.\n\n"
+=======
+        output += "\n\nSee the [ask usage](https://pr-agent-docs.codium.ai/tools/ask/) page for a comprehensive guide on using this tool.\n\n"
+>>>>>>> upstream/main
 
         return output
 
@@ -187,7 +199,11 @@ some_config2=...
 
 """
 
+<<<<<<< HEAD
         output += f"\n\nSee the improve [usage page](https://dvmn-agent-docs.codium.ai/tools/improve/) for a comprehensive guide on using this tool.\n\n"
+=======
+        output += "\n\nSee the improve [usage page](https://pr-agent-docs.codium.ai/tools/improve/) for a comprehensive guide on using this tool.\n\n"
+>>>>>>> upstream/main
 
         return output
 
@@ -202,5 +218,9 @@ It can be invoked manually by commenting on any PR:
 /help_docs "..."
 ```
 """
+<<<<<<< HEAD
         output += f"\n\nSee the [help_docs usage](https://dvmn-agent-docs.codium.ai/tools/help_docs/) page for a comprehensive guide on using this tool.\n\n"
+=======
+        output += "\n\nSee the [help_docs usage](https://pr-agent-docs.codium.ai/tools/help_docs/) page for a comprehensive guide on using this tool.\n\n"
+>>>>>>> upstream/main
         return output
