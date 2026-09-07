@@ -1,0 +1,12 @@
+meta:
+  title: "Use Decimal for money math in app/pricing.py"
+  description: "Refactor pricing to Decimal to avoid float rounding. No behaviour change."
+  surface: [backend, python]
+
+# A clean PR: no findings expected. Any key issue reported here counts as a
+# false positive (precision guard). This is the most important fixture kind.
+must_find: []
+must_not_find: []
+
+max_findings: 3
+max_cost_usd: 0.10

@@ -38,4 +38,4 @@ jobs:
       - id: test
         name: Test dev docker
         run: |
-          docker run --rm pragent/dvmn-agent:test pytest -v tests/unittest
+          docker run --rm pragent/dvmn-agent:test pytest -v tests/unittest tests/eval

@@ -1,0 +1,16 @@
+{
+  "request": {
+    "model": "synthetic",
+    "system": "(synthetic cassette - PR1 pilot; re-recorded against the real model in PR2)",
+    "user": "(synthetic)"
+  },
+  "response": {
+    "resp": "review:\n  estimated_effort_to_review_[1-5]: 2\n  relevant_tests: 'No'\n  key_issues_to_review:\n    - relevant_file: app/db.py\n      issue_header: 'SQL Injection'\n      issue_content: \"get_user_by_email builds the query with '%s' %% email string formatting (CWE-89). A crafted email such as ' OR '1'='1 bypasses the filter and can return arbitrary rows. Use a parameterised query: cur.execute('SELECT id, email, is_admin FROM users WHERE email = ?', (email,)).\"\n      start_line: 12\n      end_line: 14\n    - relevant_file: app/db.py\n      issue_header: 'SQL Injection'\n      issue_content: \"list_orders interpolates user_id and status directly into an f-string query (CWE-89). status is a string under caller control and is not escaped. Bind both values as parameters instead.\"\n      start_line: 22\n      end_line: 25\n  security_concerns: \"SQL injection: app/db.py builds SQL with string formatting in get_user_by_email and list_orders (CWE-89). Both must use parameterised queries.\"\n",
+    "finish_reason": "stop"
+  },
+  "meta": {
+    "synthetic": true,
+    "cost_usd": 0.0,
+    "elapsed_ms": 0.0
+  }
+}

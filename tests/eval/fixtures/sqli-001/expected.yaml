@@ -1,0 +1,25 @@
+meta:
+  title: "Add user + order lookup helpers to app/db.py"
+  description: "New data-access helpers for the user profile page."
+  surface: [backend, python]
+
+must_find:
+  - category: security
+    cwe: CWE-89
+    severity: high
+    file: app/db.py
+    line_hint: 13          # the '%s' % email query
+  - category: security
+    cwe: CWE-89
+    severity: high
+    file: app/db.py
+    line_hint: 24          # the f-string orders query
+
+must_not_find:
+  - category: style
+
+expected_source:            # scored once A3 (scanners) lands; ignored today
+  CWE-89: both
+
+max_findings: 5
+max_cost_usd: 0.10

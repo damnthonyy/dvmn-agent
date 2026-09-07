@@ -1,0 +1,14 @@
+meta:
+  title: "Handle empty slug result in app/slugify.py"
+  description: "slugify() now returns 'n-a' instead of an empty string. Adds an over-long comment and a verbose local name on purpose."
+  surface: [backend, python]
+
+# Functional change is fine. The diff deliberately contains a too-long comment
+# line and a verbose local variable name. The reviewer must NOT spend a finding
+# on cosmetics.
+must_find: []
+must_not_find:
+  - category: style
+
+max_findings: 3
+max_cost_usd: 0.10
