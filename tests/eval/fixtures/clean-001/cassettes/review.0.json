@@ -1,0 +1,16 @@
+{
+  "request": {
+    "model": "synthetic",
+    "system": "(synthetic cassette - PR1 pilot; re-recorded against the real model in PR2)",
+    "user": "(synthetic)"
+  },
+  "response": {
+    "resp": "review:\n  estimated_effort_to_review_[1-5]: 1\n  relevant_tests: 'No'\n  key_issues_to_review: []\n  security_concerns: 'No'\n",
+    "finish_reason": "stop"
+  },
+  "meta": {
+    "synthetic": true,
+    "cost_usd": 0.0,
+    "elapsed_ms": 0.0
+  }
+}

@@ -47,6 +47,22 @@ PR-Agent automates AI-assisted reviews for pull requests across multiple git pro
 - End-to-end suites require provider tokens (`TOKEN_GITHUB`, `TOKEN_GITLAB`, `BITBUCKET_USERNAME`, `BITBUCKET_PASSWORD`) and may take several minutes; run them only when credentials and sandboxes are configured.
 - The health test (`tests/health_test/main.py`) exercises `/describe`, `/review`, and `/improve`; update expected artifacts if prompts change meaningfully.
 
+## Eval golden set (`tests/eval/`)
+
+- Measures **review quality** (not just "does it crash"): fixture PRs under
+  `tests/eval/fixtures/<id>/` (`diff.patch` + `expected.yaml`) scored for recall / precision
+  / findings-count / cost.
+- **Replay** (default, runs in CI, no key): `PYTHONPATH=. pytest tests/eval` — reads recorded
+  responses from `fixtures/<id>/cassettes/`. `PYTHONPATH=. python -m tests.eval.run_eval`
+  prints the per-fixture + aggregate table.
+- **Record / live** (needs `OPENAI_KEY`):
+  `PYTHONPATH=. python -m tests.eval.run_eval --record --only <id>` rewrites cassettes;
+  `--live --check-baseline` runs real calls and diffs against `tests/eval/BASELINE.json`.
+- Any change to `pr_agent/settings/*prompts.toml` that shifts the number of LLM calls
+  invalidates cassettes — re-record and commit them in the same PR, and report the eval delta.
+- Nothing in `pr_agent/` is patched by the harness; it registers a `fixture` git provider at
+  runtime and injects a cassette-backed AI handler.
+
 ## Commit and Pull Request Guidelines
 
 - Follow `CONTRIBUTING.md`: keep changes focused, add or update tests, and use Conventional Commit-style messages (e.g., `fix: handle missing repo settings gracefully`).

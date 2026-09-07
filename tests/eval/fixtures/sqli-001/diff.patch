@@ -1,0 +1,33 @@
+diff --git a/app/db.py b/app/db.py
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/db.py
+@@ -0,0 +1,29 @@
++import sqlite3
++
++
++def _conn():
++    return sqlite3.connect("app.db")
++
++
++def get_user_by_email(email: str):
++    """Look up a single user row by email address."""
++    conn = _conn()
++    cur = conn.cursor()
++    # Build the query from the caller-supplied email.
++    query = "SELECT id, email, is_admin FROM users WHERE email = '%s'" % email
++    cur.execute(query)
++    row = cur.fetchone()
++    conn.close()
++    return row
++
++
++def list_orders(user_id: int, status: str):
++    conn = _conn()
++    cur = conn.cursor()
++    query = f"SELECT * FROM orders WHERE user_id = {user_id} AND status = '{status}'"
++    cur.execute(query)
++    rows = cur.fetchall()
++    conn.close()
++    return rows

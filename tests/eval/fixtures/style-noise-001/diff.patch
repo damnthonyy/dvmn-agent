@@ -1,0 +1,23 @@
+diff --git a/app/slugify.py b/app/slugify.py
+index 4444444..5555555 100644
+--- a/app/slugify.py
++++ b/app/slugify.py
+@@ -1,13 +1,19 @@
+ import re
+ import unicodedata
+
+
+ def slugify(value: str) -> str:
++    # normalise unicode to ascii, lowercase, then collapse every run of non-alphanumeric characters into single hyphens and trim
+     value = unicodedata.normalize("NFKD", value)
+     value = value.encode("ascii", "ignore").decode("ascii")
+-    value = value.lower().strip()
+-    value = re.sub(r"[^a-z0-9]+", "-", value)
+-    return value.strip("-")
++    value = value.lower()
++    value = value.strip()
++    result_slug = re.sub(r"[^a-z0-9]+", "-", value)
++    result_slug = result_slug.strip("-")
++    if not result_slug:
++        result_slug = "n-a"
++    return result_slug

@@ -1,0 +1,30 @@
+diff --git a/app/pricing.py b/app/pricing.py
+index 2222222..3333333 100644
+--- a/app/pricing.py
++++ b/app/pricing.py
+@@ -1,21 +1,24 @@
++from decimal import Decimal
++
++DEFAULT_TAX_RATE = Decimal("0.20")
++
++
+ def line_total(unit_price, quantity):
+-    return unit_price * quantity
++    """Total for a single order line, before tax."""
++    return Decimal(str(unit_price)) * quantity
+
+
+-def order_total(lines, tax_rate=0.2):
+-    subtotal = 0
++def order_total(lines, tax_rate=DEFAULT_TAX_RATE):
++    """Sum every line and apply tax. `lines` is an iterable of (price, qty)."""
++    subtotal = Decimal("0")
+     for price, qty in lines:
+         subtotal += line_total(price, qty)
+-    return subtotal + subtotal * tax_rate
++    return subtotal + subtotal * Decimal(str(tax_rate))
+
+
+ def format_money(amount):
+-    return "$" + str(round(amount, 2))
++    return f"${amount:.2f}"
