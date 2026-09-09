@@ -10,8 +10,13 @@ from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.pr_processing import retry_with_fallback_models
 from pr_agent.algo.token_handler import TokenHandler
+<<<<<<< HEAD
 from pr_agent.algo.utils import (ModelType, clip_tokens, get_max_tokens,
                                  load_yaml)
+=======
+from pr_agent.algo.utils import ModelType, clip_tokens, get_max_tokens, load_yaml
+from pr_agent.command_descriptions import COMMAND_DESCRIPTIONS
+>>>>>>> upstream/main
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import (BitbucketServerProvider, GithubProvider,
                                     get_git_provider_with_context)
@@ -91,7 +96,7 @@ class PRHelpMessage:
             # Perform replacements in a single pass and convert to lowercase
             return pattern.sub(lambda m: replacements[m.group()], cleaned).lower()
         except Exception:
-            get_logger().exception(f"Error while formatting markdown header", artifacts={'header': header})
+            get_logger().exception("Error while formatting markdown header", artifacts={'header': header})
             return ""
 
 
@@ -153,7 +158,7 @@ class PRHelpMessage:
                     get_logger().warning(f"failing to parse response: {response_yaml}, publishing the response as is")
                     if get_settings().config.publish_output:
                         answer_str = f"### Question: \n{self.question_str}\n\n"
-                        answer_str += f"### Answer:\n\n"
+                        answer_str += "### Answer:\n\n"
                         answer_str += response_yaml
                         self.git_provider.publish_comment(answer_str)
                     return ""
@@ -164,8 +169,8 @@ class PRHelpMessage:
                     get_logger().info(f"Could not find relevant answer for the question: {self.question_str}")
                     if get_settings().config.publish_output:
                         answer_str = f"### Question: \n{self.question_str}\n\n"
-                        answer_str += f"### Answer:\n\n"
-                        answer_str += f"Could not find relevant information to answer the question. Please provide more details and try again."
+                        answer_str += "### Answer:\n\n"
+                        answer_str += "Could not find relevant information to answer the question. Please provide more details and try again."
                         self.git_provider.publish_comment(answer_str)
                     return ""
 
@@ -174,7 +179,7 @@ class PRHelpMessage:
                 if response_str:
                     answer_str += f"### Question: \n{self.question_str}\n\n"
                     answer_str += f"### Answer:\n{response_str.strip()}\n\n"
-                    answer_str += f"#### Relevant Sources:\n\n"
+                    answer_str += "#### Relevant Sources:\n\n"
                     base_path = "https://qodo-merge-docs.qodo.ai/"
                     for section in relevant_sections:
                         file = section.get('file_name').strip().removesuffix('.md')
@@ -210,17 +215,15 @@ class PRHelpMessage:
                 tool_names.append(f"[REVIEW]({base_path}/review/)")
                 tool_names.append(f"[IMPROVE]({base_path}/improve/)")
                 tool_names.append(f"[UPDATE CHANGELOG]({base_path}/update_changelog/)")
-                tool_names.append(f"[HELP DOCS]({base_path}/help_docs/)")
                 tool_names.append(f"[ADD DOCS]({base_path}/add_docs/)")
                 tool_names.append(f"[ASK]({base_path}/ask/)")
                 tool_names.append(f"[GENERATE CUSTOM LABELS]({base_path}/generate_labels/)")
 
                 descriptions = []
-                descriptions.append("Generates PR description - title, type, summary, code walkthrough and labels")
-                descriptions.append("Adjustable feedback about the PR, possible issues, security concerns, review effort and more")
-                descriptions.append("Code suggestions for improving the PR")
+                descriptions.append(COMMAND_DESCRIPTIONS["describe"])
+                descriptions.append(COMMAND_DESCRIPTIONS["review"])
+                descriptions.append(COMMAND_DESCRIPTIONS["improve"])
                 descriptions.append("Automatically updates the changelog")
-                descriptions.append("Answers a question regarding this repository, or a given one, based on given documentation path")
                 descriptions.append("Generates documentation to methods/functions/classes that changed in the PR")
                 descriptions.append("Answering free-text questions about the PR")
                 descriptions.append("Generates custom labels for the PR, based on specific guidelines defined by the user")
@@ -230,7 +233,6 @@ class PRHelpMessage:
                 commands.append("`/review`")
                 commands.append("`/improve`")
                 commands.append("`/update_changelog`")
-                commands.append("`/help_docs`")
                 commands.append("`/add_docs`")
                 commands.append("`/ask`")
                 commands.append("`/generate_labels`")
@@ -240,30 +242,37 @@ class PRHelpMessage:
                 checkbox_list.append(" - [ ] Run <!-- /review -->")
                 checkbox_list.append(" - [ ] Run <!-- /improve -->")
                 checkbox_list.append(" - [ ] Run <!-- /update_changelog -->")
-                checkbox_list.append(" - [ ] Run <!-- /help_docs -->")
                 checkbox_list.append(" - [ ] Run <!-- /add_docs -->")
-                checkbox_list.append("[*]")
                 checkbox_list.append("[*]")
                 checkbox_list.append("[*]")
                 checkbox_list.append("[*]")
                 checkbox_list.append("[*]")
 
                 if isinstance(self.git_provider, GithubProvider) and not get_settings().config.get('disable_checkboxes', False):
-                    pr_comment += f"<table><tr align='left'><th align='left'>Tool</th><th align='left'>Description</th><th align='left'>Trigger Interactively :gem:</th></tr>"
+                    pr_comment += "<table><tr align='left'><th align='left'>Tool</th><th align='left'>Description</th><th align='left'>Trigger Interactively :gem:</th></tr>"
                     for i in range(len(tool_names)):
                         pr_comment += f"\n<tr><td align='left'>\n\n<strong>{tool_names[i]}</strong></td>\n<td>{descriptions[i]}</td>\n<td>\n\n{checkbox_list[i]}\n</td></tr>"
                     pr_comment += "</table>\n\n"
+<<<<<<< HEAD
                     pr_comment += f"""\n\n(1) Note that each tool can be [triggered automatically](https://dvmn-agent-docs.codium.ai/usage-guide/automations_and_usage/#github-app-automatic-tools-when-a-new-pr-is-opened) when a new PR is opened, or called manually by [commenting on a PR](https://dvmn-agent-docs.codium.ai/usage-guide/automations_and_usage/#online-usage)."""
                     pr_comment += f"""\n\n(2) Tools marked with [*] require additional parameters to be passed. For example, to invoke the `/ask` tool, you need to comment on a PR: `/ask "<question content>"`. See the relevant documentation for each tool for more details."""
+=======
+                    pr_comment += """\n\n(1) Note that each tool can be [triggered automatically](https://pr-agent-docs.codium.ai/usage-guide/automations_and_usage/#github-app-automatic-tools-when-a-new-pr-is-opened) when a new PR is opened, or called manually by [commenting on a PR](https://pr-agent-docs.codium.ai/usage-guide/automations_and_usage/#online-usage)."""
+                    pr_comment += """\n\n(2) Tools marked with [*] require additional parameters to be passed. For example, to invoke the `/ask` tool, you need to comment on a PR: `/ask "<question content>"`. See the relevant documentation for each tool for more details."""
+>>>>>>> upstream/main
                 elif isinstance(self.git_provider, BitbucketServerProvider):
                     # only support basic commands in BBDC
                     pr_comment = generate_bbdc_table(tool_names[:4], descriptions[:4])
                 else:
-                    pr_comment += f"<table><tr align='left'><th align='left'>Tool</th><th align='left'>Command</th><th align='left'>Description</th></tr>"
+                    pr_comment += "<table><tr align='left'><th align='left'>Tool</th><th align='left'>Command</th><th align='left'>Description</th></tr>"
                     for i in range(len(tool_names)):
                         pr_comment += f"\n<tr><td align='left'>\n\n<strong>{tool_names[i]}</strong></td><td>{commands[i]}</td><td>{descriptions[i]}</td></tr>"
                     pr_comment += "</table>\n\n"
+<<<<<<< HEAD
                     pr_comment += f"""\n\nNote that each tool can be [invoked automatically](https://dvmn-agent-docs.codium.ai/usage-guide/automations_and_usage/) when a new PR is opened, or called manually by [commenting on a PR](https://dvmn-agent-docs.codium.ai/usage-guide/automations_and_usage/#online-usage)."""
+=======
+                    pr_comment += """\n\nNote that each tool can be [invoked automatically](https://pr-agent-docs.codium.ai/usage-guide/automations_and_usage/) when a new PR is opened, or called manually by [commenting on a PR](https://pr-agent-docs.codium.ai/usage-guide/automations_and_usage/#online-usage)."""
+>>>>>>> upstream/main
 
                 if get_settings().config.publish_output:
                     self.git_provider.publish_comment(pr_comment)
