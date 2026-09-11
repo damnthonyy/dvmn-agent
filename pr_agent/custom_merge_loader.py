@@ -1,10 +1,20 @@
+<<<<<<< HEAD
 import tomllib  # tomllib should be used instead of Py toml for Python 3.11+
+=======
+import tomllib  #tomllib should be used instead of Py toml for Python 3.11+
+>>>>>>> upstream/main
 from pathlib import Path
 
 from jinja2.exceptions import SecurityError
 
 from pr_agent.log import get_logger
 
+<<<<<<< HEAD
+=======
+# Prevent out-of-memory exceptions by limiting settings files to 100 MB (sufficient for up to ~1M lines).
+MAX_TOML_SIZE_IN_BYTES = 100 * 1024 * 1024
+
+>>>>>>> upstream/main
 
 def load(obj, env=None, silent=True, key=None, filename=None):
     """
@@ -16,15 +26,13 @@ def load(obj, env=None, silent=True, key=None, filename=None):
     - Supports Dynaconf's fresh_vars feature for dynamic reloading.
     Args:
         obj: The Dynaconf settings instance to update.
-        env: The current environment name (upper case). Defaults to 'DEVELOPMENT'. Note: currently unused.
+        env: Unused compatibility parameter. Defaults to None.
         silent (bool): If True, suppress exceptions and log warnings/errors instead.
         key (str | None): Load only this top-level key (section) if provided; otherwise, load all keys from the files.
-        filename (str | None): Custom filename for tests (not used when settings_files are provided).
+        filename (str | None): Unused compatibility parameter. Settings files come from the Dynaconf object.
     Returns:
         None
     """
-
-    MAX_TOML_SIZE_IN_BYTES = 100 * 1024 * 1024 # Prevent out of mem. exceptions by limiting to 100 MBs which is sufficient for up to 1M lines
 
     # Get the list of files to load
     # TODO: hasattr(obj, 'settings_files') for some reason returns False. Need to use 'settings_file'
