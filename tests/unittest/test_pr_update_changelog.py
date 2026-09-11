@@ -2,7 +2,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from pr_agent.git_providers.github_provider import GithubProvider
 from pr_agent.tools.pr_update_changelog import PRUpdateChangelog
+
+
+class _CustomProvider:
+    """Provider that opts in without inheriting from GithubProvider."""
+
+    def supports_changelog_update_review(self) -> bool:
+        return True
 
 
 class TestPRUpdateChangelog:
@@ -138,7 +146,26 @@ class TestPRUpdateChangelog:
         assert new_content == "## v1.1.0\n- New feature"
         assert "to commit the new content" in answer
 
+    def _make_no_push_provider(self, extra_spec=None):
+        spec = ["publish_comment", "remove_initial_comment", "get_pr_branch", "get_pr_description",
+                "get_commit_messages", "get_languages", "get_files", "get_pr_file_content",
+                "is_supported", "supports_changelog_update_review", "pr"]
+        if extra_spec:
+            spec += extra_spec
+        provider = MagicMock(spec=spec)
+        provider.pr = MagicMock()
+        provider.pr.title = "Test PR"
+        provider.get_pr_branch.return_value = "feature-branch"
+        provider.get_pr_description.return_value = "Test description"
+        provider.get_commit_messages.return_value = "fix: test commit"
+        provider.get_languages.return_value = {"Python": 80, "JavaScript": 20}
+        provider.get_files.return_value = ["test.py", "test.js"]
+        provider.get_pr_file_content.return_value = ""
+        provider.supports_changelog_update_review.return_value = False
+        return provider
+
     @pytest.mark.asyncio
+<<<<<<< HEAD
     async def test_run_without_push_support(self, changelog_tool, mock_git_provider):
         """Test running changelog update when git provider doesn't support pushing."""
         # Arrange
@@ -155,6 +182,67 @@ class TestPRUpdateChangelog:
             # Assert
             mock_git_provider.publish_comment.assert_called_once()
             assert "not currently supported" in str(mock_git_provider.publish_comment.call_args)
+=======
+    async def test_run_without_push_support(self, mock_ai_handler):
+        """When the provider can't push (no create_or_update_pr_file), the changelog must still
+        be generated and published as a comment (graceful degradation), not dropped entirely."""
+        provider = self._make_no_push_provider()  # spec omits create_or_update_pr_file
+        provider.is_supported.return_value = True
+
+        with patch('pr_agent.tools.pr_update_changelog.get_git_provider', return_value=lambda url: provider), \
+             patch('pr_agent.tools.pr_update_changelog.get_main_pr_language', return_value="Python"), \
+             patch('pr_agent.tools.pr_update_changelog.retry_with_fallback_models'), \
+             patch('pr_agent.tools.pr_update_changelog.get_settings') as mock_settings:
+            mock_settings.return_value.pr_update_changelog.push_changelog_changes = True
+            mock_settings.return_value.config.publish_output = True
+            mock_settings.return_value.pr_update_changelog.extra_instructions = ""
+            mock_settings.return_value.pr_update_changelog_prompt.system = ""
+            mock_settings.return_value.pr_update_changelog_prompt.user = ""
+            mock_settings.return_value.get.return_value = {}
+            tool = PRUpdateChangelog("https://example.com/pr/123", ai_handler=lambda: mock_ai_handler)
+
+            # Push isn't possible -> degrade to comment mode (don't push, don't drop the output).
+            assert tool.push_skipped_reason == "not supported for this git provider"
+            assert tool.commit_changelog is False
+
+            tool.prediction = "## v1.1.0\n- New feature"
+            await tool.run()
+
+            published = " ".join(str(c) for c in provider.publish_comment.call_args_list)
+            assert "Changelog updates" in published  # the generated changelog was posted
+            assert "not pushed" in published          # with a note it wasn't committed
+
+    @pytest.mark.asyncio
+    async def test_run_restricted_mode_publishes_comment_instead_of_pushing(self, mock_ai_handler):
+        """restricted_mode: the provider supports the push API, but is_supported('push_code') is
+        False, so the changelog must be published as a comment rather than pushed to the repo."""
+        provider = self._make_no_push_provider(extra_spec=["create_or_update_pr_file"])
+        provider.is_supported.return_value = False  # restricted_mode disables push_code
+
+        with patch('pr_agent.tools.pr_update_changelog.get_git_provider', return_value=lambda url: provider), \
+             patch('pr_agent.tools.pr_update_changelog.get_main_pr_language', return_value="Python"), \
+             patch('pr_agent.tools.pr_update_changelog.retry_with_fallback_models'), \
+             patch('pr_agent.tools.pr_update_changelog.get_settings') as mock_settings:
+            mock_settings.return_value.pr_update_changelog.push_changelog_changes = True
+            mock_settings.return_value.config.publish_output = True
+            mock_settings.return_value.pr_update_changelog.extra_instructions = ""
+            mock_settings.return_value.pr_update_changelog_prompt.system = ""
+            mock_settings.return_value.pr_update_changelog_prompt.user = ""
+            mock_settings.return_value.get.return_value = {}
+            tool = PRUpdateChangelog("https://example.com/pr/1", ai_handler=lambda: mock_ai_handler)
+
+            assert tool.push_skipped_reason == "restricted by configuration (restricted_mode)"
+            assert tool.commit_changelog is False
+            provider.is_supported.assert_called_with("push_code")
+
+            tool.prediction = "## v1.1.0\n- feat"
+            await tool.run()
+
+            provider.create_or_update_pr_file.assert_not_called()  # never pushed
+            published = " ".join(str(c) for c in provider.publish_comment.call_args_list)
+            assert "Changelog updates" in published
+            assert "not pushed" in published
+>>>>>>> upstream/main
 
     @pytest.mark.asyncio
     async def test_run_with_push_support(self, changelog_tool, mock_git_provider):
@@ -182,6 +270,84 @@ class TestPRUpdateChangelog:
             call_args = mock_git_provider.create_or_update_pr_file.call_args
             assert call_args[1]['file_path'] == 'CHANGELOG.md'
             assert call_args[1]['branch'] == 'feature-branch'
+
+    def test_push_changelog_update_creates_review_when_supported(self, changelog_tool, mock_git_provider):
+        """When supported, pushing the changelog creates a PR review on the committed changes."""
+        mock_git_provider.create_or_update_pr_file = MagicMock()
+        mock_git_provider.get_pr_branch.return_value = "feature-branch"
+        mock_git_provider.supports_changelog_update_review.return_value = True
+        mock_git_provider.pr.get_commits.return_value = ["commit-123"]
+        mock_git_provider.pr.create_review = MagicMock()
+        new_content = "# Updated changelog content"
+        answer = "Line 1\nLine 2"
+
+        with patch("pr_agent.tools.pr_update_changelog.get_settings") as mock_settings, patch(
+            "pr_agent.tools.pr_update_changelog.sleep"
+        ):
+            mock_settings.return_value.pr_update_changelog.get.return_value = True
+
+            changelog_tool._push_changelog_update(new_content, answer)
+
+            mock_git_provider.create_or_update_pr_file.assert_called_once_with(
+                file_path="CHANGELOG.md",
+                branch="feature-branch",
+                contents=new_content,
+                message="[skip ci] Update CHANGELOG.md",
+            )
+            mock_git_provider.pr.create_review.assert_called_once_with(
+                commit="commit-123",
+                comments=[
+                    dict(
+                        body="CHANGELOG.md update",
+                        path="CHANGELOG.md",
+                        line=2,
+                        start_line=1,
+                    )
+                ],
+            )
+            mock_git_provider.publish_comment.assert_not_called()
+
+    def test_push_changelog_update_skips_review_when_not_supported(self, changelog_tool, mock_git_provider):
+        """A provider without the capability is never asked for a commit-scoped review."""
+        mock_git_provider.create_or_update_pr_file = MagicMock()
+        mock_git_provider.get_pr_branch.return_value = "feature-branch"
+        mock_git_provider.supports_changelog_update_review.return_value = False
+        new_content = "# Updated changelog content"
+        answer = "Changes made"
+
+        with patch("pr_agent.tools.pr_update_changelog.get_settings") as mock_settings, patch(
+            "pr_agent.tools.pr_update_changelog.sleep"
+        ):
+            mock_settings.return_value.pr_update_changelog.get.return_value = True
+
+            changelog_tool._push_changelog_update(new_content, answer)
+
+            mock_git_provider.create_or_update_pr_file.assert_called_once_with(
+                file_path="CHANGELOG.md",
+                branch="feature-branch",
+                contents=new_content,
+                message="[skip ci] Update CHANGELOG.md",
+            )
+            mock_git_provider.pr.get_commits.assert_not_called()
+            mock_git_provider.publish_comment.assert_not_called()
+
+    def test_push_changelog_update_falls_back_to_comment_on_review_exception(self, changelog_tool, mock_git_provider):
+        """When creating a review raises an exception, it falls back to publishing a comment."""
+        mock_git_provider.create_or_update_pr_file = MagicMock()
+        mock_git_provider.get_pr_branch.return_value = "feature-branch"
+        mock_git_provider.supports_changelog_update_review.return_value = True
+        mock_git_provider.pr.get_commits.side_effect = Exception("API error")
+        new_content = "# Updated changelog content"
+        answer = "Changes made"
+
+        with patch("pr_agent.tools.pr_update_changelog.get_settings") as mock_settings, patch(
+            "pr_agent.tools.pr_update_changelog.sleep"
+        ):
+            mock_settings.return_value.pr_update_changelog.get.return_value = True
+
+            changelog_tool._push_changelog_update(new_content, answer)
+
+            mock_git_provider.publish_comment.assert_called_once_with(f"**Changelog updates: 🔄**\n\n{answer}")
 
     def test_push_changelog_update(self, changelog_tool, mock_git_provider):
         """Test the push changelog update functionality."""
@@ -214,6 +380,18 @@ class TestPRUpdateChangelog:
 
         # Act & Assert
         assert hasattr(mock_git_provider, "create_or_update_pr_file")
+
+    @pytest.mark.parametrize(
+        "provider_class, expected",
+        [(GithubProvider, True), (_CustomProvider, True), (MagicMock, False)],
+    )
+    def test_supports_changelog_update_review_follows_provider_capability(self, provider_class, expected):
+        if provider_class is MagicMock:
+            provider = MagicMock()
+            provider.supports_changelog_update_review.return_value = False
+        else:
+            provider = provider_class.__new__(provider_class)
+        assert provider.supports_changelog_update_review() is expected
 
     @pytest.mark.parametrize("existing_content,new_entry,expected_order", [
         (
