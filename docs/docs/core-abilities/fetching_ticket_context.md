@@ -1,9 +1,10 @@
 # Fetching Ticket Context for PRs
 
-`Supported Git Platforms: GitHub, GitLab, Bitbucket`
+`Supported Git Platforms: GitHub, GitLab, Bitbucket, Azure DevOps`
 
-!!! note "Branch-name issue linking: GitHub only (for now)"
-    Extracting issue links from the **branch name** (and the optional `branch_issue_regex` setting) is currently implemented for **GitHub only**. Support for GitLab, Bitbucket, and other platforms is planned for a later release. The GitHub flow was the most relevant to implement first; other providers will follow.
+!!! note "Branch-name linking: Jira keys on all providers; numeric GitHub issues on GitHub only"
+    **Jira** ticket keys (e.g. `ABC-123`) are extracted from the branch name on **every git provider**.
+    Extracting **numeric GitHub issue** links from the branch name (and the optional `branch_issue_regex` setting) is currently implemented for **GitHub only**; support for other providers is planned for a later release.
 
 ## Overview
 
@@ -12,8 +13,9 @@ This integration enriches the review process by automatically surfacing relevant
 
 **Ticket systems supported**:
 
-- [GitHub/Gitlab Issues](#githubgitlab-issues-integration)
+- [GitHub/GitLab Issues](#githubgitlab-issues-integration)
 - [Jira](#jira-integration)
+- [Asana](#asana-integration)
 
 **Ticket data fetched:**
 
@@ -30,6 +32,7 @@ Ticket Recognition Requirements:
 
 - The PR description should contain a link to the ticket or if the branch name starts with the ticket id / number.
 - For Jira tickets, you should follow the instructions in [Jira Integration](#jira-integration) in order to authenticate with Jira.
+- For Asana tickets, see [Asana Integration](#asana-integration).
 
 ### Describe tool
 
@@ -48,7 +51,7 @@ Each ticket will be assigned a label (Compliance/Alignment level), Indicates the
 - Not Compliant
 - PR Code Verified
 
-![Ticket Compliance](https://www.qodo.ai/images/pr_agent/ticket_compliance_review.png){width=768}
+![Ticket Compliance](../assets/ticket_compliance_review.png){width=768}
 
 A `PR Code Verified` label indicates the PR code meets ticket requirements, but requires additional manual testing beyond the code scope. For example - validating UI display across different environments (Mac, Windows, mobile, etc.).
 
@@ -76,10 +79,10 @@ A `PR Code Verified` label indicates the PR code meets ticket requirements, but 
 
     the `review` tool will also validate that the PR code doesn't contain any additional content that is not related to the ticket. If it does, the PR will be labeled at best as `PR Code Verified`, and the `review` tool will provide a comment with the additional unrelated content found in the PR code.
 
-## GitHub/Gitlab Issues Integration
+## GitHub/GitLab Issues Integration
 
-PR-Agent will automatically recognize GitHub/Gitlab issues mentioned in the PR description and fetch the issue content.
-Examples of valid GitHub/Gitlab issue references:
+PR-Agent will automatically recognize GitHub/GitLab issues mentioned in the PR description and fetch the issue content.
+Examples of valid GitHub/GitLab issue references:
 
 - `https://github.com/<ORG_NAME>/<REPO_NAME>/issues/<ISSUE_NUMBER>` or `https://gitlab.com/<ORG_NAME>/<REPO_NAME>/-/issues/<ISSUE_NUMBER>`
 - `#<ISSUE_NUMBER>`
@@ -92,9 +95,64 @@ This branch-name detection applies **only when the git provider is GitHub**. Sup
 
 Since PR-Agent is integrated with GitHub, it doesn't require any additional configuration to fetch GitHub issues.
 
+## Asana Integration
+
+PR-Agent can detect Asana task references in PR descriptions, fetch the referenced tasks through the
+[Asana API](https://developers.asana.com/reference/gettask), and include their titles, descriptions, and tags in the
+ticket compliance check.
+
+**Supported reference formats:**
+
+- Legacy links: `https://app.asana.com/0/{project_gid}/{task_gid}`
+- Current permalinks: `https://app.asana.com/1/{workspace_gid}/task/{task_gid}`
+- Current project links: `https://app.asana.com/1/{workspace_gid}/project/{project_gid}/task/{task_gid}`
+- Current Home links: `https://app.asana.com/1/{workspace_gid}/home/task/{task_gid}`
+- Task comment links ending in `/comment/{comment_gid}` (the parent task is fetched)
+
+**How to link a PR to an Asana task:**
+
+Include an Asana task URL in your PR description. PR-Agent will detect it automatically and include it in the related
+tickets list.
+
+### Authentication
+
+Create an [Asana personal access token](https://developers.asana.com/docs/personal-access-token) with access to the
+tasks that PR-Agent should read. Configure it in `.secrets.toml`:
+
+```toml
+[asana]
+api_token = "YOUR_PERSONAL_ACCESS_TOKEN"
+```
+
+For environment-based deployments, set the equivalent Dynaconf environment variable:
+
+```bash
+ASANA__API_TOKEN="YOUR_PERSONAL_ACCESS_TOKEN"
+```
+
+The token is sent only to Asana's fixed task API endpoint as a Bearer token. When no token is configured or a task is
+not accessible to that token, PR-Agent skips that Asana task instead of evaluating compliance against placeholder
+content. API request timeout can be adjusted with `asana.request_timeout` (10 seconds by default, capped at 60 seconds).
+
+### Ticket limits
+
+PR-Agent fetches the first three detected Asana tasks at most, preserving their description order. This is an
+additive, provider-specific limit, with native tickets listed before Asana tasks:
+
+- On GitHub, the existing limit of three GitHub issues is preserved, plus up to three Asana tasks.
+- On Azure DevOps, all linked work items are preserved, plus up to three Asana tasks.
+- On other providers, up to three detected Asana tasks can supply ticket context.
+
+Keeping these limits separate prevents Asana references from silently displacing native tickets and avoids changing
+the established ticket-extraction behavior of existing providers.
+
 ## Jira Integration
 
-We support both Jira Cloud and Jira Server/Data Center.
+Only **Jira Cloud** is supported. The base URL is derived from a validated site name
+(`jira_site` → `https://<site>.atlassian.net`) rather than taken as a free-form URL, so
+the configured destination is always an Atlassian Cloud host. Jira Server / Data Center
+(self-hosted) uses a free-form host and is not supported yet; it can be added once
+base-URL handling for the self-hosted case is settled.
 
 ### Jira Cloud
 
@@ -116,14 +174,21 @@ You can create an API token from your Atlassian account:
 
 ```toml
 [jira]
-jira_api_token = "YOUR_API_TOKEN"
+jira_site = "<JIRA_SITE>"   # the "<site>" in https://<site>.atlassian.net (e.g. "mycompany")
 jira_api_email = "YOUR_EMAIL"
+jira_api_token = "YOUR_API_TOKEN"
 ```
 
-### Jira Data Center/Server
+`jira_site` is your Jira Cloud site name — the part before `.atlassian.net` (for
+`https://mycompany.atlassian.net`, the site is `mycompany`). PR-Agent builds the base URL
+as `https://<jira_site>.atlassian.net`; it does not accept a full URL, so configuration
+cannot redirect the authenticated request to another host. Store `jira_api_email` and
+`jira_api_token` as secrets (environment variables or the secrets file), not in
+repository-committed configuration.
 
-#### Using Basic Authentication for Jira Data Center/Server
+#### Acceptance criteria / requirements (optional)
 
+<<<<<<< HEAD
 You can use your Jira username and password to authenticate with Jira Data Center/Server.
 
 In your Configuration file/Environment variables/Secrets file, add the following lines:
@@ -184,13 +249,18 @@ This following steps will help you check if the basic auth is working correctly,
 
 1. Create a [Personal Access Token (PAT)](https://confluence.atlassian.com/enterprise/using-personal-access-tokens-1026032365.html) in your Jira account
 2. In your Configuration file/Environment variables/Secrets file, add the following lines:
+=======
+To include a ticket's acceptance criteria in the analysis, set `jira_requirements_field`
+to the id of the custom field that holds it. The field id is specific to your Jira
+instance (for example `customfield_10127`); leave it empty to skip requirements.
+>>>>>>> upstream/main
 
 ```toml
 [jira]
-jira_base_url = "YOUR_JIRA_BASE_URL" # e.g. https://jira.example.com
-jira_api_token = "YOUR_API_TOKEN"
+jira_requirements_field = "customfield_10127"
 ```
 
+<<<<<<< HEAD
 ##### Validating PAT token via Python script
 
 If you are facing issues retrieving tickets in PR-Agent with PAT token, you can validate the flow using a Python script.
@@ -298,23 +368,16 @@ PR-Agent supports connecting to multiple JIRA servers using different authentica
 
 
 
+=======
+>>>>>>> upstream/main
 ### How to link a PR to a Jira ticket
 
 To integrate with Jira, you can link your PR to a ticket using either of these methods:
 
 **Method 1: Description Reference:**
 
-Include a ticket reference in your PR description, using either the complete URL format `https://<JIRA_ORG>.atlassian.net/browse/ISSUE-123` or the shortened ticket ID `ISSUE-123` (without prefix or suffix for the shortened ID).
+Include a ticket reference in your PR description, using either the complete URL format `https://<JIRA_SITE>.atlassian.net/browse/ISSUE-123` or the shortened ticket ID `ISSUE-123` (without prefix or suffix for the shortened ID).
 
 **Method 2: Branch Name Detection:**
 
 Name your branch with the ticket ID as a prefix (e.g., `ISSUE-123-feature-description` or `ISSUE-123/feature-description`).
-
-!!! note "Jira Base URL"
-    For shortened ticket IDs or branch detection (method 2 for JIRA cloud), you must configure the Jira base URL in your configuration file under the [jira] section:
-
-    ```toml
-    [jira]
-    jira_base_url = "https://<JIRA_ORG>.atlassian.net"
-    ```
-    Where `<JIRA_ORG>` is your Jira organization identifier (e.g., `mycompany` for `https://mycompany.atlassian.net`).
