@@ -6,10 +6,18 @@ import requests
 
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger, setup_logger
+<<<<<<< HEAD
 from tests.e2e_tests.e2e_utils import (FILE_PATH,
                                        IMPROVE_START_WITH_REGEX_PATTERN,
                                        NEW_FILE_CONTENT, NUM_MINUTES,
                                        PR_HEADER_START_WITH, REVIEW_START_WITH)
+=======
+from tests.e2e_tests.e2e_utils import (
+    FILE_PATH,
+    NEW_FILE_CONTENT,
+    NUM_MINUTES,
+)
+>>>>>>> upstream/main
 
 log_level = os.environ.get("LOG_LEVEL", "INFO")
 setup_logger(log_level)
@@ -117,7 +125,7 @@ def test_e2e_run_gitea_app():
         pr_number = pr['number']
 
         for i in range(NUM_MINUTES):
-            logger.info(f"Waiting for the PR to get all the tool results...")
+            logger.info("Waiting for the PR to get all the tool results...")
             time.sleep(60)
 
             response = requests.get(
@@ -159,12 +167,17 @@ def test_e2e_run_gitea_app():
         )
         response.raise_for_status()
 
+<<<<<<< HEAD
         logger.info(f"Succeeded in running e2e test for Gitea app on the PR")
+=======
+        logger.info("Succeeded in running e2e test for Gitea app on the PR")
+>>>>>>> upstream/main
     except Exception as e:
         logger.error(f"Failed to run e2e test for Gitea app: {e}")
         raise
     finally:
         try:
+<<<<<<< HEAD
             if headers is None or gitea_url is None:
                 return
 
@@ -179,6 +192,20 @@ def test_e2e_run_gitea_app():
                 f"{gitea_url}/api/v1/repos/{owner}/{repo_name}/git/refs/heads/{new_branch}",
                 headers=headers
             )
+=======
+            if headers is not None and gitea_url is not None:
+                if pr_number is not None:
+                    requests.patch(
+                        f"{gitea_url}/api/v1/repos/{owner}/{repo_name}/pulls/{pr_number}",
+                        headers=headers,
+                        json={'state': 'closed'}
+                    )
+
+                requests.delete(
+                    f"{gitea_url}/api/v1/repos/{owner}/{repo_name}/git/refs/heads/{new_branch}",
+                    headers=headers
+                )
+>>>>>>> upstream/main
         except Exception as cleanup_error:
             logger.error(f"Failed to clean up after test: {cleanup_error}")
 
