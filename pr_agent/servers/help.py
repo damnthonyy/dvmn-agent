@@ -1,15 +1,21 @@
+from pr_agent.command_descriptions import COMMAND_DESCRIPTIONS
+
+
 class HelpMessage:
     @staticmethod
     def get_general_commands_text():
-       commands_text = "> - **/review**: Request a review of your Pull Request.   \n" \
-                "> - **/describe**: Update the PR title and description based on the contents of the PR.   \n" \
-                "> - **/improve [--extended]**: Suggest code improvements. Extended mode provides a higher quality feedback.   \n" \
+       commands_text = f"> - **/review**: {COMMAND_DESCRIPTIONS['review']}   \n" \
+                f"> - **/describe**: {COMMAND_DESCRIPTIONS['describe']}   \n" \
+                f"> - **/improve [--extended]**: {COMMAND_DESCRIPTIONS['improve']} Extended mode provides more thorough feedback.   \n" \
                 "> - **/ask \\<QUESTION\\>**: Ask a question about the PR.   \n" \
                 "> - **/update_changelog**: Update the changelog based on the PR's contents.   \n" \
-                "> - **/help_docs \\<QUESTION\\>**: Given a path to documentation (either for this repository or for a given one), ask a question.   \n" \
                 "> - **/add_docs**: Generate docstring for new components introduced in the PR.   \n" \
                 "> - **/generate_labels**: Generate labels for the PR based on the PR's contents.   \n\n" \
+<<<<<<< HEAD
                 ">See the [tools guide](https://dvmn-agent-docs.codium.ai/tools/) for more details.\n" \
+=======
+                ">See the [tools guide](https://docs.pr-agent.ai/tools/) for more details.\n" \
+>>>>>>> upstream/main
                 ">To list the possible configuration parameters, add a **/config** comment.   \n"
        return commands_text
 
@@ -22,14 +28,24 @@ class HelpMessage:
     @staticmethod
     def get_review_usage_guide():
         output ="**Overview:**\n"
+<<<<<<< HEAD
         output +=("The `review` tool scans the PR code changes, and generates a PR review which includes several types of feedbacks, such as possible PR issues, security threats and relevant test in the PR. More feedbacks can be [added](https://dvmn-agent-docs.codium.ai/tools/review/#general-configurations) by configuring the tool.\n\n"
                   "The tool can be triggered [automatically](https://dvmn-agent-docs.codium.ai/usage-guide/automations_and_usage/#github-app-automatic-tools-when-a-new-pr-is-opened) every time a new PR is opened, or can be invoked manually by commenting on any PR.\n")
+=======
+        output += (f"{COMMAND_DESCRIPTIONS['review']} "
+                  "More feedback can be [added](https://docs.pr-agent.ai/tools/review/#configuration-options) by configuring the tool.\n\n"
+                  "The tool can be triggered [automatically](https://docs.pr-agent.ai/usage-guide/automations_and_usage/#github-app-automatic-tools-when-a-new-pr-is-opened) every time a new PR is opened, or can be invoked manually by commenting on any PR.\n")
+>>>>>>> upstream/main
         output +="""\
 - When commenting, to edit [configurations](https://github.com/Codium-ai/dvmn-agent/blob/main/pr_agent/settings/configuration.toml#L23) related to the review tool (`pr_reviewer` section), use the following template:
 ```
 /review --pr_reviewer.some_config1=... --pr_reviewer.some_config2=...
 ```
+<<<<<<< HEAD
 - With a [configuration file](https://dvmn-agent-docs.codium.ai/usage-guide/configuration_options/), use the following template:
+=======
+- With a [configuration file](https://docs.pr-agent.ai/usage-guide/configuration_options/), use the following template:
+>>>>>>> upstream/main
 ```
 [pr_reviewer]
 some_config1=...
@@ -37,7 +53,11 @@ some_config2=...
 ```
     """
 
+<<<<<<< HEAD
         output += f"\n\nSee the review [usage page](https://dvmn-agent-docs.codium.ai/tools/review/) for a comprehensive guide on using this tool.\n\n"
+=======
+        output += "\n\nSee the review [usage page](https://docs.pr-agent.ai/tools/review/) for a comprehensive guide on using this tool.\n\n"
+>>>>>>> upstream/main
 
         return output
 
@@ -46,15 +66,24 @@ some_config2=...
     @staticmethod
     def get_describe_usage_guide():
         output = "**Overview:**\n"
+<<<<<<< HEAD
         output += "The `describe` tool scans the PR code changes, and generates a description for the PR - title, type, summary, walkthrough and labels. "
         output += "The tool can be triggered [automatically](https://dvmn-agent-docs.codium.ai/usage-guide/automations_and_usage/#github-app-automatic-tools-when-a-new-pr-is-opened) every time a new PR is opened, or can be invoked manually by commenting on a PR.\n"
+=======
+        output += f"{COMMAND_DESCRIPTIONS['describe']} "
+        output += "The tool can be triggered [automatically](https://docs.pr-agent.ai/usage-guide/automations_and_usage/#github-app-automatic-tools-when-a-new-pr-is-opened) every time a new PR is opened, or can be invoked manually by commenting on a PR.\n"
+>>>>>>> upstream/main
         output += """\
 
 When commenting, to edit [configurations](https://github.com/Codium-ai/dvmn-agent/blob/main/pr_agent/settings/configuration.toml#L46) related to the describe tool (`pr_description` section), use the following template:
 ```
 /describe --pr_description.some_config1=... --pr_description.some_config2=...
 ```
+<<<<<<< HEAD
 With a [configuration file](https://dvmn-agent-docs.codium.ai/usage-guide/configuration_options/), use the following template:
+=======
+With a [configuration file](https://docs.pr-agent.ai/usage-guide/configuration_options/), use the following template:
+>>>>>>> upstream/main
 ```
 [pr_description]
 some_config1=...
@@ -66,7 +95,11 @@ some_config2=...
         # automation
         output += "<tr><td><details> <summary><strong> Enabling\\disabling automation </strong></summary><hr>\n\n"
         output += """\
+<<<<<<< HEAD
 - When you first install the app, the [default mode](https://dvmn-agent-docs.codium.ai/usage-guide/automations_and_usage/#github-app-automatic-tools-when-a-new-pr-is-opened) for the describe tool is:
+=======
+- When you first install the app, the [default mode](https://docs.pr-agent.ai/usage-guide/automations_and_usage/#github-app-automatic-tools-when-a-new-pr-is-opened) for the describe tool is:
+>>>>>>> upstream/main
 ```
 pr_commands = ["/describe", ...]
 ```
@@ -92,7 +125,11 @@ Note that when markers are enabled, if the original PR description does not cont
         output += """\
 The default labels of the `describe` tool are quite generic: [`Bug fix`, `Tests`, `Enhancement`, `Documentation`, `Other`].
 
+<<<<<<< HEAD
 If you specify [custom labels](https://dvmn-agent-docs.codium.ai/tools/describe/#handle-custom-labels-from-the-repos-labels-page) in the repo's labels page or via configuration file, you can get tailored labels for your use cases.
+=======
+If you specify [custom labels](https://docs.pr-agent.ai/tools/describe/#handle-custom-labels-from-the-repos-labels-page) in the repo's labels page or via configuration file, you can get tailored labels for your use cases.
+>>>>>>> upstream/main
 Examples for custom labels:
 - `Main topic:performance` - pr_agent:The main topic of this PR is performance
 - `New endpoint` - pr_agent:A new endpoint was added in this PR
@@ -134,7 +171,11 @@ Use triple quotes to write multi-line instructions. Use bullet points to make th
 
         output += "</table>"
 
+<<<<<<< HEAD
         output += f"\n\nSee the [describe usage](https://dvmn-agent-docs.codium.ai/tools/describe/) page for a comprehensive guide on using this tool.\n\n"
+=======
+        output += "\n\nSee the [describe usage](https://docs.pr-agent.ai/tools/describe/) page for a comprehensive guide on using this tool.\n\n"
+>>>>>>> upstream/main
 
         return output
 
@@ -160,7 +201,11 @@ You can ask questions about the entire PR, about specific code lines, or about a
         #
         # output += "</table>"
 
+<<<<<<< HEAD
         output += f"\n\nSee the [ask usage](https://dvmn-agent-docs.codium.ai/tools/ask/) page for a comprehensive guide on using this tool.\n\n"
+=======
+        output += "\n\nSee the [ask usage](https://docs.pr-agent.ai/tools/ask/) page for a comprehensive guide on using this tool.\n\n"
+>>>>>>> upstream/main
 
         return output
 
@@ -168,8 +213,13 @@ You can ask questions about the entire PR, about specific code lines, or about a
     @staticmethod
     def get_improve_usage_guide():
         output = "**Overview:**\n"
+<<<<<<< HEAD
         output += "The code suggestions tool, named `improve`, scans the PR code changes, and automatically generates code suggestions for improving the PR."
         output += "The tool can be triggered [automatically](https://dvmn-agent-docs.codium.ai/usage-guide/automations_and_usage/#github-app-automatic-tools-when-a-new-pr-is-opened) every time a new PR is opened, or can be invoked manually by commenting on a PR.\n"
+=======
+        output += f"{COMMAND_DESCRIPTIONS['improve']} "
+        output += "The tool can be triggered [automatically](https://docs.pr-agent.ai/usage-guide/automations_and_usage/#github-app-automatic-tools-when-a-new-pr-is-opened) every time a new PR is opened, or can be invoked manually by commenting on a PR.\n"
+>>>>>>> upstream/main
         output += """\
 - When commenting, to edit [configurations](https://github.com/Codium-ai/dvmn-agent/blob/main/pr_agent/settings/configuration.toml#L78) related to the improve tool (`pr_code_suggestions` section), use the following template:
 
@@ -177,7 +227,11 @@ You can ask questions about the entire PR, about specific code lines, or about a
 /improve --pr_code_suggestions.some_config1=... --pr_code_suggestions.some_config2=...
 ```
 
+<<<<<<< HEAD
 - With a [configuration file](https://dvmn-agent-docs.codium.ai/usage-guide/configuration_options/), use the following template:
+=======
+- With a [configuration file](https://docs.pr-agent.ai/usage-guide/configuration_options/), use the following template:
+>>>>>>> upstream/main
 
 ```
 [pr_code_suggestions]
@@ -187,7 +241,11 @@ some_config2=...
 
 """
 
+<<<<<<< HEAD
         output += f"\n\nSee the improve [usage page](https://dvmn-agent-docs.codium.ai/tools/improve/) for a comprehensive guide on using this tool.\n\n"
+=======
+        output += "\n\nSee the improve [usage page](https://docs.pr-agent.ai/tools/improve/) for a comprehensive guide on using this tool.\n\n"
+>>>>>>> upstream/main
 
         return output
 
@@ -202,5 +260,9 @@ It can be invoked manually by commenting on any PR:
 /help_docs "..."
 ```
 """
+<<<<<<< HEAD
         output += f"\n\nSee the [help_docs usage](https://dvmn-agent-docs.codium.ai/tools/help_docs/) page for a comprehensive guide on using this tool.\n\n"
+=======
+        output += "\n\nSee the [help_docs usage](https://docs.pr-agent.ai/tools/help_docs/) page for a comprehensive guide on using this tool.\n\n"
+>>>>>>> upstream/main
         return output
