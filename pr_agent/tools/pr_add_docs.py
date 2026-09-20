@@ -3,14 +3,18 @@ import textwrap
 from functools import partial
 from typing import Dict
 
-from jinja2 import Environment, StrictUndefined
-
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
-from pr_agent.algo.pr_processing import get_pr_diff, retry_with_fallback_models
+from pr_agent.algo.pr_processing import (
+    OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD,
+    get_pr_diff,
+    retry_with_fallback_models,
+)
+from pr_agent.algo.prompt_fragments import render_diff_hunk_format
+from pr_agent.algo.token_budget import AttemptTokenBudget
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.utils import load_yaml
-from pr_agent.config_loader import get_settings
+from pr_agent.config_loader import get_settings, get_verbosity_level
 from pr_agent.git_providers import get_git_provider
 from pr_agent.git_providers.git_provider import get_main_pr_language
 from pr_agent.log import get_logger
@@ -39,6 +43,10 @@ class PRAddDocs:
             "diff": "",  # empty diff for initial calculation
             "extra_instructions": get_settings().pr_add_docs.extra_instructions,
             "commit_messages_str": self.git_provider.get_commit_messages(),
+            "diff_hunk_format": render_diff_hunk_format(
+                include_line_numbers=True,
+                include_ai_metadata=False,
+            ),
             'docs_for_language': get_docs_for_language(self.main_language,
                                                        get_settings().pr_add_docs.docs_style),
         }
@@ -48,45 +56,86 @@ class PRAddDocs:
                                           get_settings().pr_add_docs_prompt.user)
 
     async def run(self):
+        temporary_comment_published = False
         try:
             get_logger().info('Generating code Docs for PR...')
             if get_settings().config.publish_output:
                 self.git_provider.publish_comment("Generating Documentation...", is_temporary=True)
+                temporary_comment_published = True
 
             get_logger().info('Preparing PR documentation...')
-            await retry_with_fallback_models(self._prepare_prediction)
+            await retry_with_fallback_models(self._prepare_prediction, git_provider=self.git_provider)
             data = self._prepare_pr_code_docs()
-            if (not data) or (not 'Code Documentation' in data):
+            if (not data) or ("Code Documentation" not in data):
                 get_logger().info('No code documentation found for PR.')
                 return
 
             if get_settings().config.publish_output:
                 get_logger().info('Pushing PR documentation...')
                 self.git_provider.remove_initial_comment()
+                temporary_comment_published = False
                 get_logger().info('Pushing inline code documentation...')
                 self.push_inline_docs(data)
         except Exception as e:
             get_logger().error(f"Failed to generate code documentation for PR, error: {e}")
+            if get_settings().config.get("propagate_tool_errors", False):
+                raise
+        finally:
+            if temporary_comment_published:
+                try:
+                    self.git_provider.remove_initial_comment()
+                except Exception as cleanup_error:
+                    get_logger().warning(
+                        f"Failed to remove the temporary documentation comment: {cleanup_error}"
+                    )
 
     async def _prepare_prediction(self, model: str):
         get_logger().info('Getting PR diff...')
 
-        self.patches_diff = get_pr_diff(self.git_provider,
-                                        self.token_handler,
-                                        model,
-                                        add_line_numbers_to_hunks=True,
-                                        disable_extra_lines=False)
+        variables = copy.deepcopy(self.vars)
+        output_token_reserve = getattr(self.ai_handler, "get_output_token_reserve", None)
+        budget = AttemptTokenBudget.for_prompt_attempt(
+            model,
+            getattr(self.git_provider, "pr", None),
+            variables,
+            get_settings().pr_add_docs_prompt.system,
+            get_settings().pr_add_docs_prompt.user,
+            ai_handler=self.ai_handler,
+            output_token_reserve=output_token_reserve,
+        )
+        patches_diff = get_pr_diff(
+            self.git_provider,
+            budget.token_handler,
+            model,
+            add_line_numbers_to_hunks=True,
+            disable_extra_lines=False,
+            output_token_reserve=output_token_reserve,
+        )
+        if not patches_diff:
+            raise ValueError("No PR diff fits the /add_docs request")
+        fitted = budget.fit_prompt_variable(
+            variables,
+            "diff",
+            patches_diff,
+            ai_handler=self.ai_handler,
+            default_output_tokens=OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD,
+            preserve_minimum=True,
+        )
+        if fitted.optional_text != patches_diff:
+            raise ValueError(
+                f"The complete packed documentation diff does not fit the token limit for {model}"
+            )
+        self.patches_diff = fitted.optional_text
+        self._attempt_system_prompt = fitted.system_prompt
+        self._attempt_user_prompt = fitted.user_prompt
 
         get_logger().info('Getting AI prediction...')
         self.prediction = await self._get_prediction(model)
 
     async def _get_prediction(self, model: str):
-        variables = copy.deepcopy(self.vars)
-        variables["diff"] = self.patches_diff  # update diff
-        environment = Environment(undefined=StrictUndefined)
-        system_prompt = environment.from_string(get_settings().pr_add_docs_prompt.system).render(variables)
-        user_prompt = environment.from_string(get_settings().pr_add_docs_prompt.user).render(variables)
-        if get_settings().config.verbosity_level >= 2:
+        system_prompt = self._attempt_system_prompt
+        user_prompt = self._attempt_user_prompt
+        if get_verbosity_level() >= 2:
             get_logger().info(f"\nSystem prompt:\n{system_prompt}")
             get_logger().info(f"\nUser prompt:\n{user_prompt}")
         response, finish_reason = await self.ai_handler.chat_completion(
@@ -99,6 +148,10 @@ class PRAddDocs:
         data = load_yaml(docs)
         if isinstance(data, list):
             data = {'Code Documentation': data}
+        if not isinstance(data, dict) or not isinstance(data.get('Code Documentation'), list):
+            get_logger().warning("The model did not return a Code Documentation list",
+                                 artifact={'prediction': docs})
+            return {'Code Documentation': []}
         return data
 
     def push_inline_docs(self, data):
@@ -109,7 +162,7 @@ class PRAddDocs:
 
         for d in data['Code Documentation']:
             try:
-                if get_settings().config.verbosity_level >= 2:
+                if get_verbosity_level() >= 2:
                     get_logger().info(f"add_docs: {d}")
                 relevant_file = d['relevant file'].strip()
                 relevant_line = int(d['relevant line'])  # absolute position
@@ -119,12 +172,12 @@ class PRAddDocs:
                     new_code_snippet = self.dedent_code(relevant_file, relevant_line, documentation, doc_placement,
                                                         add_original_line=True)
 
-                    body = f"**Suggestion:** Proposed documentation\n```suggestion\n" + new_code_snippet + "\n```"
+                    body = "**Suggestion:** Proposed documentation\n```suggestion\n" + new_code_snippet + "\n```"
                     docs.append({'body': body, 'relevant_file': relevant_file,
-                                             'relevant_lines_start': relevant_line,
-                                             'relevant_lines_end': relevant_line})
+                                 "relevant_lines_start": relevant_line,
+                                 "relevant_lines_end": relevant_line})
             except Exception:
-                if get_settings().config.verbosity_level >= 2:
+                if get_verbosity_level() >= 2:
                     get_logger().info(f"Could not parse code docs: {d}")
 
         is_successful = self.git_provider.publish_code_suggestions(docs)
@@ -139,13 +192,22 @@ class PRAddDocs:
             self.diff_files = self.git_provider.diff_files if self.git_provider.diff_files \
                 else self.git_provider.get_diff_files()
             original_initial_line = None
+            file_lines = []
             for file in self.diff_files:
                 if file.filename.strip() == relevant_file:
-                    original_initial_line = file.head_file.splitlines()[relevant_lines_start - 1]
+                    file_lines = file.head_file.splitlines() if file.head_file else []
+                    if not 1 <= relevant_lines_start <= len(file_lines):
+                        get_logger().warning(
+                            "Could not dedent code snippet, relevant_lines_start is out of range",
+                            artifact={'filename': file.filename,
+                                      'relevant_lines_start': relevant_lines_start,
+                                      'num_lines': len(file_lines)})
+                        return new_code_snippet
+                    original_initial_line = file_lines[relevant_lines_start - 1]
                     break
             if original_initial_line:
-                if doc_placement == 'after':
-                    line = file.head_file.splitlines()[relevant_lines_start]
+                if doc_placement == 'after' and relevant_lines_start < len(file_lines):
+                    line = file_lines[relevant_lines_start]
                 else:
                     line = original_initial_line
                 suggested_initial_line = new_code_snippet.splitlines()[0]
@@ -160,7 +222,7 @@ class PRAddDocs:
                     else:
                         new_code_snippet = new_code_snippet.rstrip() + "\n" + original_initial_line
         except Exception as e:
-            if get_settings().config.verbosity_level >= 2:
+            if get_verbosity_level() >= 2:
                 get_logger().info(f"Could not dedent code snippet for file {relevant_file}, error: {e}")
 
         return new_code_snippet
