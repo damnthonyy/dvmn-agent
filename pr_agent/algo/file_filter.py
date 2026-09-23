@@ -12,9 +12,8 @@ def filter_ignored(files, platform = 'github'):
 
     try:
         # load regex patterns, and translate glob patterns to regex
-        patterns = get_settings().ignore.regex
-        if isinstance(patterns, str):
-            patterns = [patterns]
+        raw_patterns = get_settings().ignore.regex
+        patterns = [raw_patterns] if isinstance(raw_patterns, str) else list(raw_patterns)
         glob_setting = get_settings().ignore.glob
         if isinstance(glob_setting, str):  # --ignore.glob=[.*utils.py], --ignore.glob=.*utils.py
             glob_setting = glob_setting.strip('[]').split(",")
@@ -35,13 +34,20 @@ def filter_ignored(files, platform = 'github'):
         for r in patterns:
             try:
                 compiled_patterns.append(re.compile(r))
-            except re.error:
-                pass
+            except re.error as e:
+                get_logger().warning(
+                    "Skipping invalid ignore pattern; files it was meant to exclude will be "
+                    "sent to the model", artifact={"pattern": r, "error": str(e)})
+
+        # Materialize GitHub incremental dict_values and other iterable file views
+        # before applying the same ignore filtering as full-review lists.
+        if files and not isinstance(files, list):
+            files = list(files)
 
         # keep filenames that _don't_ match the ignore regex
-        if files and isinstance(files, list):
+        if files:
             for r in compiled_patterns:
-                if platform == 'github':
+                if platform in ('github', 'codecommit'):
                     files = [f for f in files if (f.filename and not r.match(f.filename))]
                 elif platform == 'bitbucket':
                     # files = [f for f in files if (f.new.path and not r.match(f.new.path))]
@@ -73,10 +79,17 @@ def filter_ignored(files, platform = 'github'):
                     files = [f for f in files if not r.match(f)]
                 elif platform == 'gitea':
                     files = [f for f in files if not r.match(f.get("filename", ""))]
+                elif platform == "gerrit":
+                    files_o = []
+                    for f in files:
+                        path = f.b_path or f.a_path
+                        if path and not r.match(path):
+                            files_o.append(f)
+                    files = files_o
 
 
     except Exception as e:
-        print(f"Could not filter file list: {e}")
+        get_logger().error(f"Could not filter file list: {e}")
 
     return files
 
