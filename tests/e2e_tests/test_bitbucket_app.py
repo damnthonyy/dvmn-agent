@@ -1,20 +1,25 @@
-import hashlib
 import os
-import re
 import time
 from datetime import datetime
 
-import jwt
 import requests
 from atlassian.bitbucket import Cloud
 from requests.auth import HTTPBasicAuth
 
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger, setup_logger
+<<<<<<< HEAD
 from tests.e2e_tests.e2e_utils import (FILE_PATH,
                                        IMPROVE_START_WITH_REGEX_PATTERN,
                                        NEW_FILE_CONTENT, NUM_MINUTES,
                                        PR_HEADER_START_WITH, REVIEW_START_WITH)
+=======
+from tests.e2e_tests.e2e_utils import (
+    FILE_PATH,
+    NEW_FILE_CONTENT,
+    NUM_MINUTES,
+)
+>>>>>>> upstream/main
 
 log_level = os.environ.get("LOG_LEVEL", "INFO")
 setup_logger(log_level)
@@ -39,7 +44,7 @@ def test_e2e_run_bitbucket_app():
         # Create a new branch from the base branch
         logger.info(f"Creating a new branch {new_branch} from {base_branch}")
         source_branch = repo.branches.get(base_branch)
-        target_repo = repo.branches.create(new_branch,source_branch.hash)
+        repo.branches.create(new_branch,source_branch.hash)
 
         # Update the file content
         url = f"https://api.bitbucket.org/2.0/repositories/{project_key}/{repo_slug}/src"
@@ -62,7 +67,7 @@ def test_e2e_run_bitbucket_app():
 
         # check every 1 minute, for 5 minutes if the PR has all the tool results
         for i in range(NUM_MINUTES):
-            logger.info(f"Waiting for the PR to get all the tool results...")
+            logger.info("Waiting for the PR to get all the tool results...")
             time.sleep(60)
             comments = list(pr.comments())
             comments_raw = [c.raw for c in comments]
@@ -75,25 +80,25 @@ def test_e2e_run_bitbucket_app():
                 if valid_review:
                     break
                 else:
-                    logger.error(f"REVIEW feedback is invalid")
+                    logger.error("REVIEW feedback is invalid")
                     raise Exception("REVIEW feedback is invalid")
             else:
                 logger.info(f"Waiting for the PR to get all the tool results. {i + 1} minute(s) passed")
         else:
-            assert False, f"After {NUM_MINUTES} minutes, the PR did not get all the tool results"
+            raise AssertionError(f"After {NUM_MINUTES} minutes, the PR did not get all the tool results")
 
         # cleanup - delete the branch
         pr.decline()
         repo.branches.delete(new_branch)
 
         # If we reach here, the test is successful
-        logger.info(f"Succeeded in running e2e test for Bitbucket app on the PR")
+        logger.info("Succeeded in running e2e test for Bitbucket app on the PR")
     except Exception as e:
         logger.error(f"Failed to run e2e test for Bitbucket app: {e}")
         # delete the branch
         pr.decline()
         repo.branches.delete(new_branch)
-        assert False
+        raise AssertionError()
 
 
 if __name__ == '__main__':
