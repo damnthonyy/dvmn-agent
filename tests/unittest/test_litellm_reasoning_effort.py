@@ -1,8 +1,13 @@
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import litellm
+import litellm.utils as litellm_utils
 import pytest
+from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
+from litellm.utils import get_optional_params
 
 import pr_agent.algo.ai_handlers.litellm_ai_handler as litellm_handler
+from pr_agent.algo import token_budget
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 
 
@@ -43,6 +48,29 @@ def mock_logger():
         yield mock_log_instance
 
 
+@pytest.fixture(autouse=True)
+def _pin_reasoning_support_metadata(monkeypatch):
+    """Pin the reasoning-support metadata this suite keys off.
+
+    CI runs litellm 1.99.0 and 1.101.0 in parallel and their bundled cost maps
+    differ, so the regression matrix forces the entries the reasoning_effort gate
+    consults in ``litellm.model_cost``: bare o3/o4/Gemini-2.5 ids register
+    directly and claude-sonnet-4-5 / claude-haiku-4-5 report True while the
+    handler's claude-family check still keeps them out of the reasoning_effort
+    path. The six Grok ids are not pinned here: the gate recognizes them through
+    the GROK_REASONING_EFFORT_LEVELS registry, so their coverage does not depend
+    on the bundled map (xai/grok-build-latest is absent from the 1.99.0 map).
+    All other bundled entries stay untouched.
+    """
+    reasoning_models = (
+        "o3-mini", "o3-mini-2025-01-31", "o3", "o3-2025-04-16",
+        "o4-mini", "o4-mini-2025-04-16", "gemini-2.5-pro", "gemini-2.5-flash",
+        "claude-sonnet-4-5", "claude-haiku-4-5",
+    )
+    for model in reasoning_models:
+        monkeypatch.setitem(litellm.model_cost, model, {"supports_reasoning": True})
+
+
 class TestLiteLLMReasoningEffort:
     """
     Comprehensive test suite for GPT-5 reasoning_effort configuration handling.
@@ -58,6 +86,66 @@ class TestLiteLLMReasoningEffort:
     """
 
     # ========== Group 1: Valid Configuration Tests ==========
+
+    @pytest.mark.parametrize("metadata_fallback", [False, True])
+    @pytest.mark.parametrize(("model", "base", "request_model", "azure_mode"), [
+        ("gpt-5.6_thinking", "gpt-5.6", "openai/gpt-5.6", False),
+        ("gpt-5.6_thinking-sol", "gpt-5.6-sol", "openai/gpt-5.6-sol", False),
+        ("azure/gpt-5.6_thinking-terra", "gpt-5.6-terra", "azure/gpt-5.6-terra", False),
+        ("gpt-5.6_thinking-luna_thinking", "gpt-5.6-luna", "openai/gpt-5.6-luna", False),
+        ("openai/gpt-5.6-sol_thinking", "gpt-5.6-sol", "openai/gpt-5.6-sol", False),
+        ("azure/gpt-5.6-terra_thinking", "gpt-5.6-terra", "azure/gpt-5.6-terra", False),
+        ("azure/openai/gpt-5.6-luna_thinking", "gpt-5.6-luna", "azure/gpt-5.6-luna", False),
+        ("openai/azure/gpt-5.6_thinking", "gpt-5.6", "openai/gpt-5.6", False),
+        ("gpt-5.6_thinking", "gpt-5.6", "azure/gpt-5.6", True),
+        ("openai/gpt-5.6-sol_thinking", "gpt-5.6-sol", "azure/gpt-5.6-sol", True),
+    ])
+    async def test_legacy_alias_token_lookup_matches_handler(
+        self, monkeypatch, mock_logger, model, base, request_model, azure_mode, metadata_fallback,
+    ):
+        """Pin both real paths to legacy aliases and explicit expected names, including infix forms."""
+        settings = create_mock_settings("medium")
+        settings.config.custom_model_max_tokens = 0
+        settings.config.max_model_tokens = 0
+        settings.openai = type("OpenAISettings", (), {"api_type": "azure", "key": "test-key"})()
+        setting_values = {"OPENAI.API_TYPE": "azure"} if azure_mode else {}
+        monkeypatch.setattr(settings, "get", lambda key, default=None: setting_values.get(key, default))
+        monkeypatch.setattr(token_budget, "get_settings", lambda: settings)
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: settings)
+        for name in ("AWS_USE_IMDS", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                     "AWS_SESSION_TOKEN", "AWS_REGION_NAME", "OPENAI_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        for name in ("api_key", "openai_key", "azure_key"):
+            monkeypatch.setattr(litellm, name, None)
+        monkeypatch.setattr(litellm_handler.openai, "api_key", None)
+
+        expected_limit = token_budget.MAX_TOKENS[base]
+        if metadata_fallback:
+            # Force the real lookup through LiteLLM without depending on future model IDs.
+            monkeypatch.delitem(token_budget.MAX_TOKENS, base)
+        lookups = []
+
+        def get_model_info(lookup_model):
+            lookups.append(lookup_model)
+            if lookup_model == request_model:
+                return {"max_input_tokens": expected_limit}
+            raise ValueError("Unexpected model name")
+
+        monkeypatch.setattr(litellm, "get_model_info", get_model_info)
+        token_limit = token_budget.get_max_tokens(model)
+        assert token_limit == expected_limit
+        assert lookups == ([request_model] if metadata_fallback else [])
+
+        with patch.object(litellm_handler, "acompletion", new_callable=AsyncMock) as completion:
+            completion.return_value = create_mock_acompletion_response()
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model=model, system="system", user="user")
+
+        completion.assert_awaited_once()
+        assert completion.call_args.kwargs["model"] == request_model
+        assert completion.call_args.kwargs["reasoning_effort"] == "medium"
+        if metadata_fallback:
+            assert lookups[0] == completion.call_args.kwargs["model"]
 
     @pytest.mark.asyncio
     async def test_gpt5_valid_reasoning_effort_none(self, monkeypatch, mock_logger):
@@ -168,6 +256,72 @@ class TestLiteLLMReasoningEffort:
             assert call_kwargs["reasoning_effort"] == "xhigh"
             assert "reasoning_effort" in call_kwargs["allowed_openai_params"]
             mock_logger.info.assert_any_call("Using reasoning_effort='xhigh' for GPT-5 model")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("model", "model_info", "expected_effort"),
+        [
+            ("azure/openai/gpt-5.2_thinking", {"supports_xhigh_reasoning_effort": True}, "xhigh"),
+            ("openai/azure/gpt-5.1-codex", {"supports_xhigh_reasoning_effort": False}, "high"),
+            ("gpt-5.2", {}, "xhigh"),
+            ("gpt-5.2", LookupError("unavailable"), "xhigh"),
+        ],
+    )
+    async def test_gpt5_reasoning_effort_max_uses_xhigh_metadata(
+        self, monkeypatch, mock_logger, model, model_info, expected_effort,
+    ):
+        """Clamp max according to LiteLLM's xhigh metadata without losing the fallback."""
+        fake_settings = create_mock_settings("max")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        lookups = []
+
+        def get_model_info(lookup_model):
+            lookups.append(lookup_model)
+            if isinstance(model_info, Exception):
+                raise model_info
+            return model_info
+
+        monkeypatch.setattr(litellm, "get_model_info", get_model_info)
+        with patch(
+            "pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion",
+            new_callable=AsyncMock,
+        ) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model=model, system="test system", user="test user")
+
+        call_kwargs = mock_completion.call_args[1]
+        assert call_kwargs["reasoning_effort"] == expected_effort
+        assert "reasoning_effort" in call_kwargs["allowed_openai_params"]
+        assert lookups == ["gpt-5.2" if "gpt-5.2" in model else "gpt-5.1-codex"]
+
+    @pytest.mark.asyncio
+    async def test_gpt5_branch_does_not_apply_the_grok_clamp(self, monkeypatch, mock_logger):
+        """Guard the GPT-5/Astra path from applying the Grok reasoning-effort clamp.
+
+        The model ID satisfies both matchers on purpose; no known shipped ID does. Routing this path
+        through _resolve_reasoning_effort() would cap 'max' at grok-4.5's 'high' instead of
+        converting it to 'xhigh'. Real-model tests cannot reach that overlap, so a later dedup could
+        reintroduce the clamp silently.
+        """
+        model = "gpt-5.2/grok-4.5"
+        grok_levels = LiteLLMAIHandler._grok_reasoning_levels_for(model)
+        assert LiteLLMAIHandler._is_gpt5_model(model)
+        assert grok_levels and "xhigh" not in grok_levels
+        fake_settings = create_mock_settings("max")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(litellm, "get_model_info", lambda lookup_model: {})
+        with patch(
+            "pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion",
+            new_callable=AsyncMock,
+        ) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model=model, system="test system", user="test user")
+
+        assert mock_completion.call_args[1]["reasoning_effort"] == "xhigh"
 
     @pytest.mark.asyncio
     async def test_gpt5_valid_reasoning_effort_minimal(self, monkeypatch, mock_logger):
@@ -318,6 +472,10 @@ class TestLiteLLMReasoningEffort:
             "gpt-5.4-2026-03-05",
             "gpt-5.5",
             "gpt-5.5-2026-04-23",
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
             "gpt-5-turbo",
             "gpt-5.1-codex",
             "gpt-5.3-codex",
@@ -682,3 +840,832 @@ class TestLiteLLMReasoningEffort:
             # Should have reasoning_effort
             call_kwargs = mock_completion.call_args[1]
             assert call_kwargs["reasoning_effort"] == "medium"
+
+    # ========== Group 8: Provider Prefix Handling ==========
+
+    @pytest.mark.asyncio
+    async def test_gpt5_with_openai_prefix_triggers_reasoning_effort(self, monkeypatch, mock_logger):
+        """Regression: model="openai/gpt-5*" must enter the GPT-5 reasoning_effort path.
+
+        Before the fix, startswith('gpt-5') was False for prefixed names, so the handler
+        sent temperature=0.2 to litellm and the request failed with UnsupportedParamsError
+        for gpt-5 codex models.
+        """
+        fake_settings = create_mock_settings("medium")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        # Isolate from runner env: LiteLLMAIHandler.__init__ branches on these vars.
+        for _var in ("AWS_USE_IMDS", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                     "AWS_SESSION_TOKEN", "AWS_REGION_NAME", "OPENAI_API_KEY"):
+            monkeypatch.delenv(_var, raising=False)
+
+        prefixed_models = [
+            "openai/gpt-5",
+            "openai/gpt-5.1-codex",
+            "openai/gpt-5.1-codex-max",
+            "openai/gpt-5.4-mini",
+        ]
+
+        for model in prefixed_models:
+            with patch(
+                'pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion',
+                new_callable=AsyncMock,
+            ) as mock_completion:
+                mock_completion.return_value = create_mock_acompletion_response()
+
+                handler = LiteLLMAIHandler()
+                await handler.chat_completion(
+                    model=model,
+                    system="test system",
+                    user="test user"
+                )
+
+                call_kwargs = mock_completion.call_args[1]
+                # GPT-5 path must trigger and drop temperature in favor of reasoning_effort
+                assert call_kwargs["reasoning_effort"] == "medium", f"failed for {model}"
+                assert "reasoning_effort" in call_kwargs["allowed_openai_params"], f"failed for {model}"
+                assert "temperature" not in call_kwargs, f"temperature leaked for {model}"
+                # Model name passed to litellm must keep the openai/ prefix exactly once
+                assert call_kwargs["model"] == model, f"model double-prefixed: {call_kwargs['model']}"
+
+    @pytest.mark.asyncio
+    async def test_gpt5_with_openai_prefix_strips_thinking_suffix(self, monkeypatch, mock_logger):
+        """Prefixed _thinking models must have the suffix removed without double-prefixing."""
+        fake_settings = create_mock_settings("low")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        # Isolate from runner env: LiteLLMAIHandler.__init__ branches on these vars.
+        for _var in ("AWS_USE_IMDS", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                     "AWS_SESSION_TOKEN", "AWS_REGION_NAME", "OPENAI_API_KEY"):
+            monkeypatch.delenv(_var, raising=False)
+
+        with patch(
+            'pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion',
+            new_callable=AsyncMock,
+        ) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(
+                model="openai/gpt-5_thinking",
+                system="test system",
+                user="test user"
+            )
+
+            call_kwargs = mock_completion.call_args[1]
+            assert call_kwargs["model"] == "openai/gpt-5"
+            assert call_kwargs["reasoning_effort"] == "low"
+
+    @pytest.mark.asyncio
+    async def test_gpt5_with_explicit_azure_prefix_preserves_routing(self, monkeypatch, mock_logger):
+        """Explicit `azure/` prefix in user config must be preserved (not silently rewritten to openai/)."""
+        fake_settings = create_mock_settings("medium")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        # Isolate from runner env: LiteLLMAIHandler.__init__ branches on these vars.
+        for _var in ("AWS_USE_IMDS", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                     "AWS_SESSION_TOKEN", "AWS_REGION_NAME", "OPENAI_API_KEY"):
+            monkeypatch.delenv(_var, raising=False)
+
+        with patch(
+            'pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion',
+            new_callable=AsyncMock,
+        ) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            # self.azure is False by default (no Azure AD creds in test env)
+            await handler.chat_completion(
+                model="azure/gpt-5.1-codex-max",
+                system="test system",
+                user="test user"
+            )
+
+            call_kwargs = mock_completion.call_args[1]
+            assert call_kwargs["reasoning_effort"] == "medium"
+            assert "temperature" not in call_kwargs
+            # Provider prefix from user config must be preserved verbatim
+            assert call_kwargs["model"] == "azure/gpt-5.1-codex-max"
+
+    @pytest.mark.asyncio
+    async def test_gpt5_in_azure_mode_does_not_stack_prefixes(self, monkeypatch, mock_logger):
+        """Azure mode must produce exactly one `azure/` prefix, even if user config also has a prefix."""
+        fake_settings = create_mock_settings("medium")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        # Isolate from runner env: LiteLLMAIHandler.__init__ branches on these vars.
+        for _var in ("AWS_USE_IMDS", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                     "AWS_SESSION_TOKEN", "AWS_REGION_NAME", "OPENAI_API_KEY"):
+            monkeypatch.delenv(_var, raising=False)
+
+        # Cases: bare name, openai/-prefixed config, azure/-prefixed config — all in azure mode
+        cases = [
+            ("gpt-5.1-codex", "azure/gpt-5.1-codex"),
+            ("openai/gpt-5.1-codex", "azure/gpt-5.1-codex"),
+            ("azure/gpt-5.1-codex", "azure/gpt-5.1-codex"),
+        ]
+
+        for input_model, expected in cases:
+            with patch(
+                'pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion',
+                new_callable=AsyncMock,
+            ) as mock_completion:
+                mock_completion.return_value = create_mock_acompletion_response()
+
+                handler = LiteLLMAIHandler()
+                handler.azure = True  # simulate Azure-mode handler
+                await handler.chat_completion(
+                    model=input_model,
+                    system="test system",
+                    user="test user"
+                )
+
+                call_kwargs = mock_completion.call_args[1]
+                # GPT-5 path must trigger
+                assert call_kwargs["reasoning_effort"] == "medium", f"failed for {input_model}"
+                assert "temperature" not in call_kwargs, f"temperature leaked for {input_model}"
+                # Exactly one azure/ prefix, no stacked/duplicated provider segments
+                assert call_kwargs["model"] == expected, (
+                    f"wrong routing for {input_model}: got {call_kwargs['model']}, expected {expected}"
+                )
+
+
+class TestLiteLLMReasoningEffortGPT6:
+    @pytest.mark.parametrize("provider", ["openai", "azure"])
+    @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+    def test_litellm_forwards_astra_reasoning(self, monkeypatch, provider, effort):
+        monkeypatch.setattr(litellm, "drop_params", False)
+        params = get_optional_params(
+            model="gpt-6-astra",
+            custom_llm_provider=provider,
+            reasoning_effort=effort,
+            allowed_openai_params=["reasoning_effort"],
+            max_completion_tokens=4096,
+        )
+        assert params["reasoning_effort"] == effort
+        assert params["max_completion_tokens"] == 4096
+        assert "max_tokens" not in params
+        assert "temperature" not in params
+
+    @pytest.mark.parametrize("prefix", ["", "openai/", "azure/", "azure/openai/"])
+    @pytest.mark.parametrize("suffix", ["", "_thinking"])
+    @pytest.mark.parametrize("azure", [False, True])
+    @pytest.mark.parametrize("effort, expected", [
+        ("low", "low"), ("medium", "medium"), ("high", "high"),
+        ("xhigh", "xhigh"), ("max", "max"), ("none", "low"), ("minimal", "low"),
+        (None, "medium"), ("invalid", "medium"),
+    ])
+    async def test_astra_request(self, monkeypatch, prefix, suffix, azure, effort, expected):
+        fake_settings = create_mock_settings(effort)
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        for name in ("AWS_USE_IMDS", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                     "AWS_SESSION_TOKEN", "AWS_REGION_NAME", "OPENAI_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+
+        with patch.object(litellm_handler, "acompletion", new_callable=AsyncMock) as completion:
+            completion.return_value = create_mock_acompletion_response()
+            handler = LiteLLMAIHandler()
+            handler.azure = azure
+            result = await handler.chat_completion(
+                model=f"{prefix}gpt-6-astra{suffix}", system="system", user="user",
+            )
+
+        kwargs = completion.call_args.kwargs
+        provider = "azure/" if azure or prefix.startswith("azure/") else "openai/"
+        assert kwargs["model"] == provider + "gpt-6-astra"
+        assert kwargs["reasoning_effort"] == expected
+        assert kwargs["allowed_openai_params"] == ["reasoning_effort"]
+        assert "temperature" not in kwargs
+        assert kwargs["messages"] == [{"role": "system", "content": "system"}, {"role": "user", "content": "user"}]
+        assert result == ("test", "stop")
+
+    async def test_astra_output_limit(self, monkeypatch):
+        fake_settings = create_mock_settings("max")
+        fake_settings.config.get = lambda key, default=None: 4096 if key == "max_output_tokens" else default
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+
+        with patch.object(litellm_handler, "acompletion", new_callable=AsyncMock) as completion:
+            completion.return_value = create_mock_acompletion_response()
+            await LiteLLMAIHandler().chat_completion(model="gpt-6-astra", system="system", user="user")
+
+        kwargs = completion.call_args.kwargs
+        assert kwargs["max_completion_tokens"] == 4096
+        assert "max_tokens" not in kwargs
+
+
+class TestLiteLLMReasoningEffortGemini:
+    """Gemini 2.5/3.x reasoning_effort handling via litellm's bundled metadata.
+
+    Gemini 2.5 and 3.x expose a thinking budget that LiteLLM maps from
+    reasoning_effort. The support probe in chat_completion matches bare and
+    provider-prefixed ids such as "vertex_ai/gemini-2.5-pro" and
+    "gemini/gemini-3.5-flash". OpenRouter models use extra_body.reasoning instead
+    and are covered by test_litellm_openrouter_controls.py.
+    """
+
+    def _isolate_env(self, monkeypatch):
+        # LiteLLMAIHandler.__init__ branches on these; clear them for a deterministic handler.
+        for _var in ("AWS_USE_IMDS", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                     "AWS_SESSION_TOKEN", "AWS_REGION_NAME", "OPENAI_API_KEY"):
+            monkeypatch.delenv(_var, raising=False)
+
+    @pytest.mark.asyncio
+    async def test_gemini_prefixed_forms_get_reasoning_effort(self, monkeypatch, mock_logger):
+        """Bare and provider-prefixed Gemini 2.5/3.x ids all receive the configured reasoning_effort."""
+        fake_settings = create_mock_settings("low")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        self._isolate_env(monkeypatch)
+
+        gemini_models = [
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini/gemini-2.5-pro",
+            "vertex_ai/gemini-2.5-pro",
+            "gemini-3.7-flash",
+            "gemini/gemini-3.5-flash",
+            "gemini/gemini-3.5-flash-lite",
+            "vertex_ai/gemini-3.5-flash",
+            "gemini/gemini-3.8-flash",
+        ]
+
+        for model in gemini_models:
+            with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+                mock_completion.return_value = create_mock_acompletion_response()
+
+                handler = LiteLLMAIHandler()
+                await handler.chat_completion(model=model, system="test system", user="test user")
+
+                call_kwargs = mock_completion.call_args[1]
+                assert call_kwargs["reasoning_effort"] == "low", f"failed for {model}"
+                # Gemini keeps temperature (it supports it) — unlike the GPT-5 path.
+                assert call_kwargs["model"] == model, f"model mutated for {model}: {call_kwargs['model']}"
+
+    @pytest.mark.asyncio
+    async def test_non_listed_gemini_gets_no_reasoning_effort(self, monkeypatch, mock_logger):
+        """A Gemini id the bundled cost map does not flag as reasoning-capable must not receive reasoning_effort.
+
+        Locks in the deliberate 3.x exclusions: gemini-3.1-flash and gemini-3.5-pro
+        are absent from litellm's bundled cost map, and gemini-3.1-pro resolves
+        only under the deepinfra/google/ prefix, so the metadata probe's suffix
+        lookup never flags their native spellings. Do not re-add them without
+        checking the bundled registry first.
+        """
+        fake_settings = create_mock_settings("low")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        self._isolate_env(monkeypatch)
+
+        for model in (
+            "openrouter/google/gemini-1.5-pro",
+            "gemini-1.5-flash",
+            "gemini/gemini-3.1-flash",
+            "gemini/gemini-3.1-pro",
+            "gemini-3.5-pro",
+        ):
+            with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+                mock_completion.return_value = create_mock_acompletion_response()
+
+                handler = LiteLLMAIHandler()
+                await handler.chat_completion(model=model, system="test system", user="test user")
+
+                call_kwargs = mock_completion.call_args[1]
+                assert "reasoning_effort" not in call_kwargs, f"unexpected reasoning_effort for {model}"
+
+    @pytest.mark.asyncio
+    async def test_suffix_match_does_not_overmatch(self, monkeypatch, mock_logger):
+        """endswith('/' + id) must not match a model whose id is a substring without the slash boundary."""
+        fake_settings = create_mock_settings("low")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        self._isolate_env(monkeypatch)
+
+        # "my-gemini-2.5-pro" is not equal to and does not end with "/gemini-2.5-pro".
+        with patch('pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion', new_callable=AsyncMock) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model="my-gemini-2.5-pro", system="test system", user="test user")
+
+            call_kwargs = mock_completion.call_args[1]
+            assert "reasoning_effort" not in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_claude_models_excluded_from_reasoning_effort_path(self, monkeypatch, mock_logger):
+        """Keep reasoning_effort off Claude models even though litellm metadata marks
+        claude-sonnet-4-5 / claude-haiku-4-5 as reasoning-capable; pr-agent routes
+        Claude reasoning only through the dedicated extended/adaptive thinking settings.
+        """
+        fake_settings = create_mock_settings("high")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        self._isolate_env(monkeypatch)
+
+        for model in ("claude-sonnet-4-5", "anthropic/claude-sonnet-4-5"):
+            with patch(
+                'pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion',
+                new_callable=AsyncMock,
+            ) as mock_completion:
+                mock_completion.return_value = create_mock_acompletion_response()
+
+                handler = LiteLLMAIHandler()
+                await handler.chat_completion(model=model, system="test system", user="test user")
+
+                call_kwargs = mock_completion.call_args[1]
+                assert "reasoning_effort" not in call_kwargs, f"reasoning_effort leaked for {model}"
+
+    @pytest.mark.asyncio
+    async def test_metadata_only_model_gets_reasoning_effort(self, monkeypatch, mock_logger):
+        """Forward reasoning_effort to a model only litellm's bundled metadata flags.
+        o1 was never in the removed SUPPORT_REASONING_EFFORT_MODELS list and is not
+        pinned by the autouse fixture, so this goes red if the metadata probe stops
+        being consulted.
+        """
+        fake_settings = create_mock_settings("low")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        self._isolate_env(monkeypatch)
+        for model in ("o1", "openai/o1"):
+            with patch(
+                'pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion',
+                new_callable=AsyncMock,
+            ) as mock_completion:
+                mock_completion.return_value = create_mock_acompletion_response()
+
+                handler = LiteLLMAIHandler()
+                await handler.chat_completion(model=model, system="test system", user="test user")
+
+                call_kwargs = mock_completion.call_args[1]
+                assert call_kwargs.get("reasoning_effort") == "low", f"reasoning_effort dropped for {model}"
+
+
+class TestLiteLLMReasoningEffortTaggedModels:
+    """Reasoning support is probed on the exact model id, so a ``:tag`` a local
+    provider attaches (ollama/replicate Bedrock) must not fall through to the
+    bare metadata entry. The OpenRouter caller strips its own routing suffix
+    before this gate, so only non-OpenRouter tagged ids are exercised here.
+    """
+
+    def _isolate_env(self, monkeypatch):
+        # LiteLLMAIHandler.__init__ branches on these; clear them for a deterministic handler.
+        for name in ("AWS_USE_IMDS", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                     "AWS_SESSION_TOKEN", "AWS_REGION_NAME", "OPENAI_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+
+    @pytest.mark.asyncio
+    async def test_tagged_ollama_id_does_not_fall_through_to_bare_entry(self, monkeypatch, mock_logger):
+        """ollama/o3:latest must not receive reasoning_effort just because the bare o3
+        entry is reasoning-capable; the tagged spelling is not what litellm registers.
+        """
+        fake_settings = create_mock_settings("low")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        self._isolate_env(monkeypatch)
+
+        with patch.object(litellm_handler, "acompletion", new_callable=AsyncMock) as completion:
+            completion.return_value = create_mock_acompletion_response()
+            await LiteLLMAIHandler().chat_completion(
+                model="ollama/o3:latest", system="system", user="user",
+            )
+
+        kwargs = completion.call_args.kwargs
+        assert "reasoning_effort" not in kwargs
+        assert "allowed_openai_params" not in kwargs
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model", [
+        "ollama/deepseek-r1:8b",
+        "gpt-oss:20b",
+        "replicate/deepseek-ai/deepseek-r1:2025-01-12",
+    ])
+    async def test_tagged_non_reasoning_spellings_receive_no_effort(self, monkeypatch, mock_logger, model):
+        """Tagged ids litellm does not register as reasoning-capable stay off the path."""
+        fake_settings = create_mock_settings("low")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        self._isolate_env(monkeypatch)
+
+        with patch.object(litellm_handler, "acompletion", new_callable=AsyncMock) as completion:
+            completion.return_value = create_mock_acompletion_response()
+            await LiteLLMAIHandler().chat_completion(model=model, system="system", user="user")
+
+        kwargs = completion.call_args.kwargs
+        assert "reasoning_effort" not in kwargs, f"unexpected reasoning_effort for {model}"
+
+    @pytest.mark.asyncio
+    async def test_exact_tagged_spelling_still_enables_reasoning(self, monkeypatch, mock_logger):
+        """A tagged id registered with its exact spelling still resolves to reasoning_effort."""
+        monkeypatch.setitem(
+            litellm.model_cost, "ollama/qwen3:8b", {"supports_reasoning": True}
+        )
+        fake_settings = create_mock_settings("low")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        self._isolate_env(monkeypatch)
+
+        with patch.object(litellm_handler, "acompletion", new_callable=AsyncMock) as completion:
+            completion.return_value = create_mock_acompletion_response()
+            await LiteLLMAIHandler().chat_completion(
+                model="ollama/qwen3:8b", system="system", user="user",
+            )
+
+        kwargs = completion.call_args.kwargs
+        assert kwargs["reasoning_effort"] == "low"
+
+
+class TestLiteLLMReasoningEffortGrok:
+    """Cover Grok-specific reasoning levels without duplicating generic OpenRouter tests."""
+
+    def _isolate_env(self, monkeypatch):
+        for variable in (
+            "AWS_USE_IMDS",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_REGION_NAME",
+            "OPENAI_API_KEY",
+        ):
+            monkeypatch.delenv(variable, raising=False)
+
+    async def _run(self, monkeypatch, model, global_effort="medium", openrouter=None, custom_llm_provider=""):
+        fake_settings = create_mock_settings(global_effort)
+        monkeypatch.setattr(
+            fake_settings.litellm,
+            "custom_llm_provider",
+            custom_llm_provider,
+            raising=False,
+        )
+        if openrouter is not None:
+            monkeypatch.setattr(
+                fake_settings,
+                "get",
+                lambda key, default=None: {"openrouter": openrouter}.get(key, default),
+            )
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        self._isolate_env(monkeypatch)
+
+        with patch(
+            "pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion",
+            new_callable=AsyncMock,
+        ) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model=model, system="test system", user="test user")
+            return mock_completion.call_args[1]
+
+    @pytest.mark.parametrize(
+        ("model", "expected"),
+        [
+            ("grok-4.5", {"low", "medium", "high"}),
+            ("xai/grok-4.5-latest", {"low", "medium", "high"}),
+            ("xai/grok-build-latest", {"low", "medium", "high"}),
+            ("xai/grok-4.6", {"low", "medium", "high", "xhigh"}),
+            ("xai/grok-4.3", {"low", "medium", "high"}),
+            ("xai/grok-4.3-latest", {"low", "medium", "high"}),
+            ("openrouter/x-ai/grok-4.6:nitro", {"low", "medium", "high", "xhigh"}),
+            ("xai/grok-3-mini", None),
+        ],
+    )
+    def test_grok_reasoning_levels_for(self, model, expected):
+        assert LiteLLMAIHandler._grok_reasoning_levels_for(model) == expected
+
+    @pytest.mark.parametrize(
+        ("model", "configured", "expected"),
+        [
+            ("xai/grok-4.6", "none", "low"),
+            ("xai/grok-4.6", "minimal", "low"),
+            ("xai/grok-4.6", "max", "xhigh"),
+            ("xai/grok-4.6", "xhigh", "xhigh"),
+            ("xai/grok-4.5", "none", "low"),
+            ("xai/grok-4.5", "max", "high"),
+            ("xai/grok-4.5", "xhigh", "high"),
+            ("xai/grok-4.5", "extreme", "extreme"),
+            ("xai/grok-4.3", "none", "low"),
+            ("xai/grok-4.3", "max", "high"),
+            ("xai/grok-4.3-latest", "xhigh", "high"),
+            ("openrouter/google/gemini-2.5-pro", "xhigh", "xhigh"),
+        ],
+    )
+    def test_clamp_grok_reasoning_effort(self, model, configured, expected):
+        assert LiteLLMAIHandler._clamp_grok_reasoning_effort(model, configured) == expected
+
+    @pytest.mark.parametrize(
+        ("model", "effort"),
+        [
+            ("grok-4.5", "low"),
+            ("grok-4.5-latest", "low"),
+            ("grok-build-latest", "low"),
+            ("grok-4.6", "xhigh"),
+        ],
+    )
+    def test_xai_grok_litellm_reasoning_param_support(self, monkeypatch, model, effort):
+        """Verify LiteLLM forwards reasoning_effort for every supported Grok alias."""
+        monkeypatch.setattr(litellm, "drop_params", False)
+        bundled_model_cost = GetModelCostMap.load_local_model_cost_map()
+        pinned_model_cost = dict(litellm.model_cost)
+        for model_key in (model, f"xai/{model}"):
+            if model_key in bundled_model_cost:
+                pinned_model_cost[model_key] = bundled_model_cost[model_key]
+            else:
+                pinned_model_cost.pop(model_key, None)
+        try:
+            with monkeypatch.context() as registry_patch:
+                registry_patch.setattr(litellm, "model_cost", pinned_model_cost)
+                litellm_utils._invalidate_model_cost_lowercase_map()
+                params = get_optional_params(
+                    model=model,
+                    custom_llm_provider="xai",
+                    reasoning_effort=effort,
+                )
+                assert params["reasoning_effort"] == effort
+        finally:
+            litellm_utils._invalidate_model_cost_lowercase_map()
+
+    def test_openai_gateway_grok_litellm_reasoning_param_support(self, monkeypatch):
+        monkeypatch.setattr(litellm, "drop_params", False)
+        bundled_model_cost = GetModelCostMap.load_local_model_cost_map()
+        pinned_model_cost = dict(litellm.model_cost)
+        for model_key in ("x-ai/grok-4.6", "openai/x-ai/grok-4.6"):
+            if model_key in bundled_model_cost:
+                pinned_model_cost[model_key] = bundled_model_cost[model_key]
+            else:
+                pinned_model_cost.pop(model_key, None)
+        try:
+            with monkeypatch.context() as registry_patch:
+                registry_patch.setattr(litellm, "model_cost", pinned_model_cost)
+                litellm_utils._invalidate_model_cost_lowercase_map()
+                params = get_optional_params(
+                    model="x-ai/grok-4.6",
+                    custom_llm_provider="openai",
+                    reasoning_effort="xhigh",
+                )
+                assert params["reasoning_effort"] == "xhigh"
+        finally:
+            litellm_utils._invalidate_model_cost_lowercase_map()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "xai/grok-4.5",
+            "xai/grok-4.5-latest",
+            "xai/grok-build-latest",
+            "xai/grok-4.6",
+        ],
+    )
+    async def test_xai_grok_forwards_reasoning_effort(self, monkeypatch, mock_logger, model):
+        monkeypatch.setattr(
+            litellm,
+            "get_supported_openai_params",
+            lambda **kwargs: [] if kwargs["model"].endswith("grok-build-latest") else ["reasoning_effort"],
+        )
+        call_kwargs = await self._run(monkeypatch, model, global_effort="low")
+
+        assert call_kwargs["model"] == model
+        assert call_kwargs["reasoning_effort"] == "low"
+        if model.endswith("grok-build-latest"):
+            assert call_kwargs["allowed_openai_params"] == ["reasoning_effort"]
+        else:
+            assert "allowed_openai_params" not in call_kwargs
+        assert "temperature" in call_kwargs
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("model", "configured", "expected"),
+        [
+            ("xai/grok-4.5", "xhigh", "high"),
+            ("xai/grok-4.6", "max", "xhigh"),
+        ],
+    )
+    async def test_xai_grok_clamps_reasoning_effort(self, monkeypatch, mock_logger, model, configured, expected):
+        monkeypatch.setattr(litellm, "get_supported_openai_params", lambda **kwargs: ["reasoning_effort"])
+        call_kwargs = await self._run(monkeypatch, model, global_effort=configured)
+
+        assert call_kwargs["reasoning_effort"] == expected
+
+    @pytest.mark.asyncio
+    async def test_openai_gateway_grok_allows_reasoning_effort(self, monkeypatch, mock_logger):
+        monkeypatch.setattr(litellm, "get_supported_openai_params", lambda **kwargs: [])
+        call_kwargs = await self._run(monkeypatch, "openai/x-ai/grok-4.6", global_effort="max")
+
+        assert call_kwargs["reasoning_effort"] == "xhigh"
+        assert call_kwargs["allowed_openai_params"] == ["reasoning_effort"]
+
+    @pytest.mark.asyncio
+    async def test_custom_openai_provider_grok_allows_reasoning_effort(self, monkeypatch, mock_logger):
+        probe = MagicMock(return_value=[])
+        monkeypatch.setattr(litellm, "get_supported_openai_params", probe)
+        call_kwargs = await self._run(
+            monkeypatch,
+            "grok-4.6",
+            global_effort="max",
+            custom_llm_provider="openai",
+        )
+
+        assert call_kwargs["reasoning_effort"] == "xhigh"
+        assert call_kwargs["allowed_openai_params"] == ["reasoning_effort"]
+        assert call_kwargs["custom_llm_provider"] == "openai"
+        probe.assert_called_once_with(model="grok-4.6", custom_llm_provider="openai")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("model", "configured", "expected"),
+        [
+            ("openrouter/x-ai/grok-4.5", "xhigh", "high"),
+            ("openrouter/x-ai/grok-4.6", "xhigh", "xhigh"),
+            ("openrouter/x-ai/grok-4.6:nitro", "max", "xhigh"),
+            ("openrouter/x-ai/grok-4.6", "none", "low"),
+        ],
+    )
+    async def test_openrouter_grok_clamps_final_effort(
+        self, monkeypatch, mock_logger, model, configured, expected
+    ):
+        call_kwargs = await self._run(
+            monkeypatch,
+            model,
+            global_effort="medium",
+            openrouter={"reasoning_effort": configured},
+        )
+
+        assert call_kwargs["model"] == model
+        assert "reasoning_effort" not in call_kwargs
+        assert call_kwargs["extra_body"]["reasoning"] == {"effort": expected}
+
+    @pytest.mark.asyncio
+    async def test_openrouter_grok_budget_overrides_clamped_none(self, monkeypatch, mock_logger):
+        call_kwargs = await self._run(
+            monkeypatch,
+            "openrouter/x-ai/grok-4.6",
+            global_effort="high",
+            openrouter={"reasoning_effort": "none", "reasoning_max_tokens": 8000},
+        )
+
+        assert call_kwargs["extra_body"]["reasoning"] == {"max_tokens": 8000}
+
+    @pytest.mark.asyncio
+    async def test_openrouter_grok_invalid_override_falls_back_to_global(self, monkeypatch, mock_logger):
+        call_kwargs = await self._run(
+            monkeypatch,
+            "openrouter/x-ai/grok-4.6",
+            global_effort="high",
+            openrouter={"reasoning_effort": "extreme"},
+        )
+
+        assert call_kwargs["extra_body"]["reasoning"] == {"effort": "high"}
+
+
+class TestAdditionalReasoningEffortModels:
+    """Verify config.additional_reasoning_effort_models opts custom OpenAI-compatible
+    model IDs into config.reasoning_effort.
+
+    Keep the override additive so litellm's bundled reasoning metadata stays
+    active and a fallback_models chain mixing a custom endpoint with a reasoning
+    model keeps receiving the configured effort. When LiteLLM does not recognize the model,
+    whitelist reasoning_effort through allowed_openai_params so the endpoint receives it.
+    """
+
+    def _settings(self, additional):
+        """Build settings whose config.get resolves additional_reasoning_effort_models."""
+        settings = create_mock_settings("low")
+        settings.config.get = lambda key, default=None: {
+            "additional_reasoning_effort_models": additional,
+        }.get(key, default)
+        return settings
+
+    def _isolate_env(self, monkeypatch):
+        # LiteLLMAIHandler.__init__ branches on these; clear them for a deterministic handler.
+        for name in ("AWS_USE_IMDS", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                     "AWS_SESSION_TOKEN", "AWS_REGION_NAME", "OPENAI_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+
+    @pytest.mark.asyncio
+    async def test_custom_openai_model_forwards_reasoning_effort(self, monkeypatch, mock_logger):
+        """Forward reasoning_effort to a config-registered model id and whitelist it when
+        LiteLLM reports no support (gate 2 regression from issue #3459)."""
+        fake_settings = self._settings(additional=["deepseek-v4-flash-0731"])
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(litellm, "get_supported_openai_params", lambda **kwargs: [])
+        self._isolate_env(monkeypatch)
+
+        with patch.object(litellm_handler, "acompletion", new_callable=AsyncMock) as completion:
+            completion.return_value = create_mock_acompletion_response()
+            await LiteLLMAIHandler().chat_completion(
+                model="openai/deepseek-v4-flash-0731", system="system", user="user",
+            )
+
+        kwargs = completion.call_args.kwargs
+        assert kwargs["reasoning_effort"] == "low"
+        assert kwargs["allowed_openai_params"] == ["reasoning_effort"]
+
+    @pytest.mark.asyncio
+    async def test_custom_model_keeps_native_litellm_support(self, monkeypatch, mock_logger):
+        """Avoid forcing the allowlist when LiteLLM already lists reasoning_effort for the model."""
+        fake_settings = self._settings(additional=["deepseek-v4-flash-0731"])
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(litellm, "get_supported_openai_params", lambda **kwargs: ["reasoning_effort"])
+        self._isolate_env(monkeypatch)
+
+        with patch.object(litellm_handler, "acompletion", new_callable=AsyncMock) as completion:
+            completion.return_value = create_mock_acompletion_response()
+            await LiteLLMAIHandler().chat_completion(
+                model="openai/deepseek-v4-flash-0731", system="system", user="user",
+            )
+
+        kwargs = completion.call_args.kwargs
+        assert kwargs["reasoning_effort"] == "low"
+        assert "allowed_openai_params" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_override_is_additive(self, monkeypatch, mock_logger):
+        """Preserve reasoning_effort for built-in models when the override adds a custom id."""
+        fake_settings = self._settings(additional=["deepseek-v4-flash-0731"])
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(litellm, "get_supported_openai_params", lambda **kwargs: [])
+        self._isolate_env(monkeypatch)
+
+        for model in (
+            "openai/deepseek-v4-flash-0731",
+            "gemini/gemini-2.5-pro",
+        ):
+            with patch.object(litellm_handler, "acompletion", new_callable=AsyncMock) as completion:
+                completion.return_value = create_mock_acompletion_response()
+                await LiteLLMAIHandler().chat_completion(model=model, system="system", user="user")
+
+            kwargs = completion.call_args.kwargs
+            assert kwargs["reasoning_effort"] == "low", f"failed for {model}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("additional", [
+        {"model": "deepseek-v4-flash-0731"},
+        ["deepseek-v4-flash-0731", 123],
+        [""],
+    ])
+    async def test_invalid_override_ignored(self, monkeypatch, mock_logger, additional):
+        """Reject an unsupported override with a warning; the model just gets no effort."""
+        fake_settings = self._settings(additional=additional)
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(litellm, "get_supported_openai_params", lambda **kwargs: [])
+        self._isolate_env(monkeypatch)
+
+        with patch.object(litellm_handler, "acompletion", new_callable=AsyncMock) as completion:
+            completion.return_value = create_mock_acompletion_response()
+            await LiteLLMAIHandler().chat_completion(
+                model="openai/deepseek-v4-flash-0731", system="system", user="user",
+            )
+
+        kwargs = completion.call_args.kwargs
+        assert "reasoning_effort" not in kwargs
+        assert any(
+            "additional_reasoning_effort_models" in call.args[0]
+            for call in mock_logger.warning.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_env_string_override_forwards_reasoning_effort(self, monkeypatch, mock_logger):
+        """Accept an env-style string override and forward reasoning_effort for its model."""
+        fake_settings = self._settings(additional="deepseek-v4-flash-0731")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(litellm, "get_supported_openai_params", lambda **kwargs: [])
+        self._isolate_env(monkeypatch)
+
+        with patch.object(litellm_handler, "acompletion", new_callable=AsyncMock) as completion:
+            completion.return_value = create_mock_acompletion_response()
+            await LiteLLMAIHandler().chat_completion(
+                model="openai/deepseek-v4-flash-0731", system="system", user="user",
+            )
+
+        kwargs = completion.call_args.kwargs
+        assert kwargs["reasoning_effort"] == "low"
+        assert kwargs["allowed_openai_params"] == ["reasoning_effort"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("configured", "expected"), [("none", "low"), ("minimal", "low")])
+    async def test_astra_normalization_survives_override(self, monkeypatch, mock_logger, configured, expected):
+        """Keep the GPT-6 Astra none/minimal -> low conversion when gpt-6-astra is added via config."""
+        settings = create_mock_settings(configured)
+        settings.config.get = lambda key, default=None: {
+            "additional_reasoning_effort_models": ["gpt-6-astra"],
+        }.get(key, default)
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: settings)
+        monkeypatch.setattr(litellm, "get_supported_openai_params", lambda **kwargs: [])
+        self._isolate_env(monkeypatch)
+
+        with patch.object(litellm_handler, "acompletion", new_callable=AsyncMock) as completion:
+            completion.return_value = create_mock_acompletion_response()
+            await LiteLLMAIHandler().chat_completion(
+                model="gpt-6-astra", system="system", user="user",
+            )
+
+        kwargs = completion.call_args.kwargs
+        assert kwargs["reasoning_effort"] == expected
+        assert kwargs["allowed_openai_params"] == ["reasoning_effort"]
+
+    @pytest.mark.asyncio
+    async def test_gpt5_max_normalization_survives_override(self, monkeypatch, mock_logger):
+        """Keep the GPT-5 max -> xhigh conversion when a gpt-5 model is added via config."""
+        settings = create_mock_settings("max")
+        settings.config.get = lambda key, default=None: {
+            "additional_reasoning_effort_models": ["gpt-5.6"],
+        }.get(key, default)
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: settings)
+        monkeypatch.setattr(litellm, "get_supported_openai_params", lambda **kwargs: [])
+        self._isolate_env(monkeypatch)
+
+        with patch.object(litellm_handler, "acompletion", new_callable=AsyncMock) as completion:
+            completion.return_value = create_mock_acompletion_response()
+            await LiteLLMAIHandler().chat_completion(
+                model="gpt-5.6", system="system", user="user",
+            )
+
+        kwargs = completion.call_args.kwargs
+        assert kwargs["reasoning_effort"] == "xhigh"
+        assert "temperature" not in kwargs
+        assert kwargs["allowed_openai_params"] == ["reasoning_effort"]
