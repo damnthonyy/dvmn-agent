@@ -1,7 +1,26 @@
+import litellm
 import pytest
 
-import pr_agent.algo.utils as utils
-from pr_agent.algo.utils import MAX_TOKENS, get_max_tokens
+import pr_agent.algo.token_budget as token_budget
+from pr_agent.algo import (
+    _CLAUDE_MODEL_FAMILIES,
+    CLAUDE_EXTENDED_THINKING_MODELS,
+    MAX_TOKENS,
+    _generate_claude_registries,
+    _validate_claude_model_family,
+)
+from pr_agent.algo.token_budget import get_max_tokens
+
+
+def _expected_max_tokens(model: str) -> int:
+    """Resolve a model's expected max tokens the same way get_max_tokens() does:
+    prefer the static MAX_TOKENS registry, else fall back to LiteLLM (issue #3196).
+    Used so tests keep working for models that were intentionally removed from
+    MAX_TOKENS because LiteLLM's fallback already resolves them correctly.
+    """
+    if model in MAX_TOKENS:
+        return MAX_TOKENS[model]
+    return int(litellm.get_model_info(model)["max_input_tokens"])
 
 
 class TestGetMaxTokens:
@@ -15,7 +34,7 @@ class TestGetMaxTokens:
             })()
         })()
 
-        monkeypatch.setattr(utils, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
 
         model = "gpt-3.5-turbo"
         expected = MAX_TOKENS[model]
@@ -31,7 +50,7 @@ class TestGetMaxTokens:
             })()
         })()
 
-        monkeypatch.setattr(utils, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
 
         assert get_max_tokens(model) == 272000
 
@@ -44,7 +63,7 @@ class TestGetMaxTokens:
             })()
         })()
 
-        monkeypatch.setattr(utils, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
 
         assert get_max_tokens(model) == 400000
 
@@ -57,7 +76,7 @@ class TestGetMaxTokens:
             })()
         })()
 
-        monkeypatch.setattr(utils, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
 
         assert get_max_tokens(model) == 400000
 
@@ -70,9 +89,268 @@ class TestGetMaxTokens:
             })()
         })()
 
-        monkeypatch.setattr(utils, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
 
         assert get_max_tokens(model) == 1050000
+
+    @pytest.mark.parametrize("model", ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])
+    def test_gpt56_model_max_tokens(self, monkeypatch, model):
+        fake_settings = type('', (), {
+            'config': type('', (), {
+                'custom_model_max_tokens': 0,
+                'max_model_tokens': 0
+            })()
+        })()
+
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        assert get_max_tokens(model) == 1050000
+
+    @pytest.mark.parametrize("prefix", ["", "openai/", "azure/", "azure/openai/"])
+    @pytest.mark.parametrize("suffix", ["", "_thinking"])
+    @pytest.mark.parametrize("cap", [0, 32000])
+    def test_gpt6_astra_model_max_tokens(self, monkeypatch, prefix, suffix, cap):
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 0,
+                "max_model_tokens": cap,
+            })()
+        })()
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(litellm, "get_model_info", lambda *args, **kwargs: pytest.fail("Static lookup expected"))
+
+        assert get_max_tokens(f"{prefix}gpt-6-astra{suffix}") == (cap or 1050000)
+
+    @pytest.mark.parametrize("model", [
+        "openai/gpt-6-astra", "azure/gpt-6-astra", "azure/openai/gpt-6-astra_thinking",
+        "gpt-6-astra_thinking",
+    ])
+    @pytest.mark.parametrize("cap, expected", [(0, 128000), (32000, 32000)])
+    def test_gpt6_astra_alias_preserves_custom_limit(self, monkeypatch, model, cap, expected):
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 128000,
+                "max_model_tokens": cap,
+            })()
+        })()
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        assert get_max_tokens(model) == expected
+
+    @pytest.mark.parametrize("model", [
+        "gpt-5_thinking",
+        "gpt-5-2025-08-07_thinking",
+        "gpt-5.4-mini_thinking",
+        "gpt-5.6_thinking",
+        "gpt-5.6-sol_thinking",
+        "gpt-5.6-terra_thinking",
+        "gpt-5.6-luna_thinking",
+    ])
+    def test_gpt5_thinking_model_max_tokens(self, monkeypatch, model):
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 0,
+                "max_model_tokens": 0
+            })()
+        })()
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+        expected = _expected_max_tokens(model.removesuffix("_thinking"))
+        assert get_max_tokens(model) == expected
+
+    @pytest.mark.parametrize("model", [
+        "gpt-5.6_thinking",
+        "openai/gpt-5.6_thinking",
+        "azure/gpt-5.6_thinking",
+    ])
+    def test_gpt5_thinking_alias_preserves_custom_limit(self, monkeypatch, model):
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 7000,
+                "max_model_tokens": 0
+            })()
+        })()
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        assert get_max_tokens(model) == 7000
+
+    @pytest.mark.parametrize("custom_limit", [
+        pytest.param(0, id="normalized-registry"),
+        pytest.param(9000, id="custom-limit"),
+    ])
+    def test_gpt5_thinking_alias_respects_max_model_tokens_cap(self, monkeypatch, custom_limit):
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": custom_limit,
+                "max_model_tokens": 7000
+            })()
+        })()
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        assert get_max_tokens("openai/gpt-5.6_thinking") == 7000
+
+    @pytest.mark.parametrize("model", [
+        "openai/gpt-5_thinking",
+        "azure/gpt-5.6_thinking",
+        "openai/gpt-5.6-sol_thinking",
+        "azure/gpt-5.6-terra_thinking",
+        "openai/gpt-5.6-luna_thinking",
+        "azure/openai/gpt-5.6_thinking",
+        "openai/gpt-5-2025-08-07_thinking",
+        "azure/gpt-5-2025-08-07_thinking",
+    ])
+    def test_gpt5_thinking_prefixed_model_max_tokens(self, monkeypatch, model):
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 0,
+                "max_model_tokens": 0
+            })()
+        })()
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+        # Strip provider prefixes then _thinking suffix to get base key
+        tmp = model
+        while tmp.startswith(("openai/", "azure/")):
+            tmp = tmp.removeprefix("openai/").removeprefix("azure/")
+        base = tmp.removesuffix("_thinking")
+        expected = _expected_max_tokens(base)
+        assert get_max_tokens(model) == expected
+
+    def test_non_gpt5_thinking_model_max_tokens_not_stripped(self, monkeypatch):
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 0,
+                "max_model_tokens": 0
+            })()
+        })()
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+        with pytest.raises(Exception):
+            get_max_tokens("gpt-4o_thinking")
+
+    @pytest.mark.parametrize("invalid_limit", ["unknown", None, {}, float("inf"), 0, -1])
+    @pytest.mark.parametrize("raw_resolves", [False, True])
+    def test_thinking_fallback_skips_invalid_token_metadata(self, monkeypatch, invalid_limit, raw_resolves):
+        """Continue past unusable metadata to the raw alias or the unresolved-model error."""
+        settings = type("Settings", (), {
+            "config": type("Config", (), {"custom_model_max_tokens": 0, "max_model_tokens": 32000})(),
+            "get": lambda self, key, default=None: default,
+        })()
+        monkeypatch.setattr(token_budget, "get_settings", lambda: settings)
+        model = "openai/gpt-5.9_thinking"
+        lookups = []
+
+        def get_model_info(candidate):
+            lookups.append(candidate)
+            return {"max_input_tokens": "65536" if raw_resolves and candidate == model else invalid_limit}
+
+        monkeypatch.setattr(litellm, "get_model_info", get_model_info)
+        if raw_resolves:
+            assert get_max_tokens(model) == 32000
+        else:
+            with pytest.raises(Exception, match="Ensure .* is defined in MAX_TOKENS"):
+                get_max_tokens(model)
+        assert lookups == ["openai/gpt-5.9", "gpt-5.9", model]
+
+    @pytest.mark.parametrize(
+        ("model", "resolved_model", "expected_lookups", "azure_mode"),
+        [
+            (
+                "gpt-5.9_thinking",
+                "openai/gpt-5.9",
+                ["openai/gpt-5.9"],
+                False,
+            ),
+            (
+                "gpt-5.9_thinking",
+                "gpt-5.9",
+                ["openai/gpt-5.9", "gpt-5.9"],
+                False,
+            ),
+            (
+                "gpt-5.9_thinking",
+                "azure/gpt-5.9",
+                ["azure/gpt-5.9"],
+                True,
+            ),
+            (
+                "openai/gpt-5.9_thinking",
+                "openai/gpt-5.9",
+                ["openai/gpt-5.9"],
+                False,
+            ),
+            (
+                "openai/gpt-5.9_thinking",
+                "azure/gpt-5.9",
+                ["azure/gpt-5.9"],
+                True,
+            ),
+            (
+                "azure/gpt-5.9_thinking",
+                "azure/gpt-5.9",
+                ["azure/gpt-5.9"],
+                False,
+            ),
+            (
+                "azure/openai/gpt-5.9_thinking",
+                "azure/gpt-5.9",
+                ["azure/gpt-5.9"],
+                False,
+            ),
+            (
+                "openai/gpt-5.9_thinking",
+                "openai/gpt-5.9_thinking",
+                ["openai/gpt-5.9", "gpt-5.9", "openai/gpt-5.9_thinking"],
+                False,
+            ),
+        ],
+    )
+    def test_gpt5_thinking_litellm_fallback(
+        self,
+        monkeypatch,
+        model,
+        resolved_model,
+        expected_lookups,
+        azure_mode,
+    ):
+        setting_values = {"OPENAI.API_TYPE": "azure"} if azure_mode else {}
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 0,
+                "max_model_tokens": 0
+            })(),
+            "get": lambda self, key, default=None: setting_values.get(key, default),
+        })()
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+        lookups = []
+
+        def mock_get_model_info(m):
+            lookups.append(m)
+            if m == resolved_model:
+                return {"max_input_tokens": 123456}
+            raise Exception("not found")
+
+        monkeypatch.setattr(litellm, "get_model_info", mock_get_model_info)
+        assert get_max_tokens(model) == 123456
+        assert lookups == expected_lookups
+
+    @pytest.mark.parametrize(
+        ("model", "expected"),
+        [
+            ("openrouter/auto", 2000000),
+            ("openrouter/free", 200000),
+            ("openrouter/fusion", 1000000),
+            ("openrouter/pareto-code", 2000000),
+        ],
+    )
+    def test_openrouter_router_model_max_tokens(self, monkeypatch, model, expected):
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 0,
+                "max_model_tokens": 0,
+            })()
+        })()
+
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        assert get_max_tokens(model) == expected
 
     # Test situations where the model is not registered and exists as a custom model
     def test_model_has_custom(self, monkeypatch):
@@ -83,7 +361,7 @@ class TestGetMaxTokens:
             })()
         })()
 
-        monkeypatch.setattr(utils, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
 
         model = "custom-model"
         expected = 5000
@@ -103,9 +381,9 @@ class TestGetMaxTokens:
             })()
         })()
 
-        monkeypatch.setattr(utils, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
 
-        expected = MAX_TOKENS[model]
+        expected = _expected_max_tokens(model)
 
         assert get_max_tokens(model) == expected
 
@@ -117,7 +395,7 @@ class TestGetMaxTokens:
             })()
         })()
 
-        monkeypatch.setattr(utils, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
 
         model = "custom-model"
 
@@ -132,7 +410,7 @@ class TestGetMaxTokens:
             })()
         })()
 
-        monkeypatch.setattr(utils, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
 
         model = "gpt-3.5-turbo"  # this model setting is 160000
         expected = 10000
@@ -146,18 +424,129 @@ class TestGetMaxTokens:
         "vertex_ai/gemini-3-pro-preview",
         "gemini/gemini-3.1-pro-preview",
         "vertex_ai/gemini-3.1-pro-preview",
+        "gemini/gemini-3.1-flash",
+        "vertex_ai/gemini-3.1-flash",
+        "gemini/gemini-3.1-pro",
+        "vertex_ai/gemini-3.1-pro",
+        "gemini/gemini-3.1-flash-lite",
+        "vertex_ai/gemini-3.1-flash-lite",
         "gemini/gemini-3.1-flash-lite-preview",
         "vertex_ai/gemini-3.1-flash-lite-preview",
+        "gemini/gemini-3.5-flash",
+        "vertex_ai/gemini-3.5-flash",
+        "gemini/gemini-3.5-flash-lite",
+        "vertex_ai/gemini-3.5-flash-lite",
+        "gemini/gemini-3.5-pro",
+        "vertex_ai/gemini-3.5-pro",
+        "gemini/gemini-3.6-flash",
+        "vertex_ai/gemini-3.6-flash",
+        "gemini/gemini-3.7-flash",
+        "vertex_ai/gemini-3.7-flash",
+        "gemini/gemini-3.8-flash",
+        "vertex_ai/gemini-3.8-flash",
     ])
-    def test_gemini_3_and_3_1_pro_preview(self, monkeypatch, model):
+    def test_gemini_3_x_models_max_tokens(self, monkeypatch, model):
         fake_settings = type("", (), {
             "config": type("", (), {
                 "custom_model_max_tokens": 0,
                 "max_model_tokens": 0,
             })()
         })()
-        monkeypatch.setattr(utils, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
         assert get_max_tokens(model) == 1048576
+
+    def test_bedrock_mantle_grok_4_3_model_max_tokens(self, monkeypatch):
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 0,
+                "max_model_tokens": 0,
+            })()
+        })()
+
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        assert get_max_tokens("bedrock_mantle/xai.grok-4.3") == 1000000
+
+    @pytest.mark.parametrize("model", [
+        "xai/grok-4.5",
+        "xai/grok-4.5-latest",
+        "xai/grok-build-latest",
+        "xai/grok-4.6",
+        "openrouter/x-ai/grok-4.5",
+        "openrouter/x-ai/grok-4.6",
+    ])
+    def test_xai_and_openrouter_grok_4_5_and_4_6_models_max_tokens(self, monkeypatch, model):
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 0,
+                "max_model_tokens": 0,
+            })()
+        })()
+
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        assert get_max_tokens(model) == 500000
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "anthropic/claude-opus-4-8",
+            "claude-opus-4-8",
+            "vertex_ai/claude-opus-4-8",
+            "bedrock/anthropic.claude-opus-4-8",
+            "bedrock/global.anthropic.claude-opus-4-8",
+            "bedrock/us.anthropic.claude-opus-4-8",
+            "bedrock/eu.anthropic.claude-opus-4-8",
+            "bedrock/au.anthropic.claude-opus-4-8",
+            "bedrock/jp.anthropic.claude-opus-4-8",
+        ],
+    )
+    def test_claude_opus_4_8_model_max_tokens(self, monkeypatch, model):
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 0,
+                "max_model_tokens": 0
+            })()
+        })()
+
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        assert get_max_tokens(model) == 1000000
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "anthropic/claude-opus-5",
+            "claude-opus-5",
+            "vertex_ai/claude-opus-5",
+            "bedrock/anthropic.claude-opus-5",
+            "bedrock/global.anthropic.claude-opus-5",
+            "bedrock/us.anthropic.claude-opus-5",
+            "bedrock/eu.anthropic.claude-opus-5",
+            "bedrock/au.anthropic.claude-opus-5",
+            "bedrock/jp.anthropic.claude-opus-5",
+            "anthropic/claude-opus-5-5",
+            "claude-opus-5-5",
+            "vertex_ai/claude-opus-5-5",
+            "bedrock/anthropic.claude-opus-5-5",
+            "bedrock/global.anthropic.claude-opus-5-5",
+            "bedrock/us.anthropic.claude-opus-5-5",
+            "bedrock/eu.anthropic.claude-opus-5-5",
+            "bedrock/au.anthropic.claude-opus-5-5",
+            "bedrock/jp.anthropic.claude-opus-5-5",
+        ],
+    )
+    def test_claude_opus_5_family_model_max_tokens(self, monkeypatch, model):
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 0,
+                "max_model_tokens": 0
+            })()
+        })()
+
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        assert get_max_tokens(model) == 1000000
 
     @pytest.mark.parametrize(
         "model",
@@ -178,7 +567,7 @@ class TestGetMaxTokens:
             })()
         })()
 
-        monkeypatch.setattr(utils, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
 
         assert get_max_tokens(model) == 1000000
 
@@ -201,9 +590,58 @@ class TestGetMaxTokens:
             })()
         })()
 
-        monkeypatch.setattr(utils, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
 
         assert get_max_tokens(model) == 200000
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "anthropic/claude-sonnet-5",
+            "claude-sonnet-5",
+            "vertex_ai/claude-sonnet-5",
+            "bedrock/anthropic.claude-sonnet-5",
+            "bedrock/global.anthropic.claude-sonnet-5",
+            "bedrock/us.anthropic.claude-sonnet-5",
+            "bedrock/au.anthropic.claude-sonnet-5",
+            "bedrock/eu.anthropic.claude-sonnet-5",
+            "bedrock/jp.anthropic.claude-sonnet-5",
+        ],
+    )
+    def test_claude_sonnet_5_model_max_tokens(self, monkeypatch, model):
+        fake_settings = type('', (), {
+            'config': type('', (), {
+                'custom_model_max_tokens': 0,
+                'max_model_tokens': 0
+            })()
+        })()
+
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        assert get_max_tokens(model) == 1000000
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "anthropic/claude-fable-5-1",
+            "claude-fable-5-1",
+            "vertex_ai/claude-fable-5-1",
+            "bedrock/anthropic.claude-fable-5-1",
+            "bedrock/global.anthropic.claude-fable-5-1",
+            "bedrock/us.anthropic.claude-fable-5-1",
+        ],
+    )
+    def test_claude_fable_5_1_model_max_tokens(self, monkeypatch, model):
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 0,
+                "max_model_tokens": 0,
+            })()
+        })()
+
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        assert get_max_tokens(model) == 1000000
 
     @pytest.mark.parametrize(
         "model",
@@ -227,6 +665,514 @@ class TestGetMaxTokens:
             })()
         })()
 
-        monkeypatch.setattr(utils, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
 
         assert get_max_tokens(model) == 200000
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "zai/glm-5.2",
+        ],
+    )
+    def test_zai_glm_5_2_model_max_tokens(self, monkeypatch, model):
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 0,
+                "max_model_tokens": 0
+            })()
+        })()
+
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        # 1M per LiteLLM (issue #3196): zai/glm-5.2 was understated at 200000.
+        assert get_max_tokens(model) == 1000000
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "moonshot/kimi-k3",
+        ],
+    )
+    def test_moonshot_kimi_k3_model_max_tokens(self, monkeypatch, model):
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 0,
+                "max_model_tokens": 0
+            })()
+        })()
+
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        # 1M per LiteLLM (issue #3196): moonshot/kimi-k3 was understated at 262144.
+        assert get_max_tokens(model) == 1048576
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "dashscope/qwen3.8-max",
+        ],
+    )
+    def test_qwen_3_8_model_max_tokens(self, monkeypatch, model):
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 0,
+                "max_model_tokens": 0
+            })()
+        })()
+
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        assert get_max_tokens(model) == 1000000
+
+
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "xiaomi_mimo/mimo-v2.5",
+        ],
+    )
+    def test_xiaomi_mimo_v2_5_model_max_tokens(self, monkeypatch, model):
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 0,
+                "max_model_tokens": 0
+            })()
+        })()
+
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        assert get_max_tokens(model) == 1048576
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "xiaomi_mimo/mimo-v2.5-pro",
+        ],
+    )
+    def test_xiaomi_mimo_v2_5_pro_model_max_tokens(self, monkeypatch, model):
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 0,
+                "max_model_tokens": 0
+            })()
+        })()
+
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        assert get_max_tokens(model) == 1048576
+
+    # --- LiteLLM fallback tests (issue #2957) ---
+
+    def test_max_tokens_takes_precedence_over_litellm(self, monkeypatch):
+        """MAX_TOKENS lookup must not consult LiteLLM."""
+        fake_settings = type('', (), {
+            'config': type('', (), {
+                'custom_model_max_tokens': 0,
+                'max_model_tokens': 0
+            })()
+        })()
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("litellm.get_model_info should not be called")
+
+        monkeypatch.setattr(litellm, "get_model_info", fail_if_called)
+
+        model = "gpt-3.5-turbo"
+        assert get_max_tokens(model) == MAX_TOKENS[model]
+
+    def test_custom_model_max_tokens_takes_precedence_over_litellm(self, monkeypatch):
+        """Positive custom_model_max_tokens must not consult LiteLLM."""
+        fake_settings = type('', (), {
+            'config': type('', (), {
+                'custom_model_max_tokens': 7000,
+                'max_model_tokens': 0
+            })()
+        })()
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("litellm.get_model_info should not be called")
+
+        monkeypatch.setattr(litellm, "get_model_info", fail_if_called)
+
+        assert get_max_tokens("fake-provider/fake-model-xyz") == 7000
+
+    def test_litellm_fallback_returns_max_input_tokens(self, monkeypatch):
+        """Unknown model resolved via litellm.get_model_info max_input_tokens."""
+        fake_settings = type('', (), {
+            'config': type('', (), {
+                'custom_model_max_tokens': 0,
+                'max_model_tokens': 0
+            })()
+        })()
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(litellm, "get_model_info",
+                            lambda model: {"max_input_tokens": 65536})
+
+        assert get_max_tokens("fake-provider/fake-model-xyz") == 65536
+
+    def test_litellm_fallback_uses_max_input_tokens_not_max_tokens(self, monkeypatch):
+        """Must use max_input_tokens, not max_tokens from litellm metadata."""
+        fake_settings = type('', (), {
+            'config': type('', (), {
+                'custom_model_max_tokens': 0,
+                'max_model_tokens': 0
+            })()
+        })()
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(litellm, "get_model_info", lambda model: {
+            "max_input_tokens": 32000,
+            "max_tokens": 99999,
+        })
+
+        assert get_max_tokens("fake-provider/fake-model-xyz") == 32000
+
+    def test_litellm_fallback_failure_preserves_existing_error(self, monkeypatch):
+        """When litellm also cannot resolve, the existing error path fires."""
+        fake_settings = type('', (), {
+            'config': type('', (), {
+                'custom_model_max_tokens': 0,
+                'max_model_tokens': 0
+            })()
+        })()
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        def raise_for_unknown(model):
+            raise Exception("This model isn't mapped yet")
+
+        monkeypatch.setattr(litellm, "get_model_info", raise_for_unknown)
+
+        with pytest.raises(Exception, match="Ensure .* is defined in MAX_TOKENS"):
+            get_max_tokens("fake-provider/fake-unknown-model")
+
+    def test_litellm_fallback_respects_max_model_tokens_cap(self, monkeypatch):
+        """max_model_tokens cap applies to LiteLLM-resolved values."""
+        fake_settings = type('', (), {
+            'config': type('', (), {
+                'custom_model_max_tokens': 0,
+                'max_model_tokens': 8000
+            })()
+        })()
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(litellm, "get_model_info",
+                            lambda model: {"max_input_tokens": 65536})
+
+        assert get_max_tokens("fake-provider/fake-model-xyz") == 8000
+
+    def test_litellm_fallback_uses_real_registry(self, monkeypatch):
+        """Unknown model resolved against the real installed LiteLLM model registry."""
+        model = "cohere/command-r-plus"
+
+        assert model not in MAX_TOKENS
+
+        model_info = litellm.get_model_info(model)
+        expected_max_input_tokens = model_info["max_input_tokens"]
+
+        assert isinstance(expected_max_input_tokens, int)
+        assert expected_max_input_tokens > 0
+
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 0,
+                "max_model_tokens": 0,
+            })()
+        })()
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        assert get_max_tokens(model) == expected_max_input_tokens
+
+    def test_claude_opus_4_8_family_expansion_and_capabilities(self):
+        """Independent verification of Opus 4.8 generated aliases and capabilities."""
+        expected_aliases = {
+            "claude-opus-4-8",
+            "anthropic/claude-opus-4-8",
+            "vertex_ai/claude-opus-4-8",
+            "bedrock/anthropic.claude-opus-4-8",
+            "bedrock/global.anthropic.claude-opus-4-8",
+            "bedrock/us.anthropic.claude-opus-4-8",
+            "bedrock/eu.anthropic.claude-opus-4-8",
+            "bedrock/au.anthropic.claude-opus-4-8",
+            "bedrock/jp.anthropic.claude-opus-4-8",
+        }
+
+        # Exact set equality against filtered MAX_TOKENS
+        actual_aliases = {k for k in MAX_TOKENS if "claude-opus-4-8" in k}
+        assert actual_aliases == expected_aliases
+
+        # Context window tokens
+        for alias in expected_aliases:
+            assert MAX_TOKENS[alias] == 1000000
+
+        # Capability lists
+        for alias in expected_aliases:
+            assert alias not in CLAUDE_EXTENDED_THINKING_MODELS
+
+        # Negative checks to ensure no over-generation
+        assert "bedrock/apac.anthropic.claude-opus-4-8" not in MAX_TOKENS
+
+    def test_claude_opus_4_6_family_expansion_and_capabilities(self):
+        """Independent verification of Opus 4.6 generated aliases and capabilities."""
+        expected_max_tokens_aliases = {
+            "claude-opus-4-6",
+            "anthropic/claude-opus-4-6",
+            "vertex_ai/claude-opus-4-6",
+            "bedrock/anthropic.claude-opus-4-6-v1:0",
+            "bedrock/global.anthropic.claude-opus-4-6-v1:0",
+            "bedrock/eu.anthropic.claude-opus-4-6-v1:0",
+            "bedrock/au.anthropic.claude-opus-4-6-v1:0",
+            "bedrock/jp.anthropic.claude-opus-4-6-v1:0",
+            "bedrock/apac.anthropic.claude-opus-4-6-v1:0",
+            "bedrock/us.anthropic.claude-opus-4-6-v1:0",
+            "claude-opus-4-6-20260120",
+            "anthropic/claude-opus-4-6-20260120",
+            "vertex_ai/claude-opus-4-6@20260120",
+            "bedrock/anthropic.claude-opus-4-6-20260120-v1:0",
+            "bedrock/us.anthropic.claude-opus-4-6-20260120-v1:0",
+        }
+
+        # Exact set equality against filtered MAX_TOKENS
+        actual_aliases = {k for k in MAX_TOKENS if "claude-opus-4-6" in k}
+        assert actual_aliases == expected_max_tokens_aliases
+
+        # Context window tokens
+        for alias in expected_max_tokens_aliases:
+            assert MAX_TOKENS[alias] == 200000
+
+        # Extended thinking: 9 aliases
+        expected_thinking_aliases = {
+            "anthropic/claude-opus-4-6",
+            "claude-opus-4-6",
+            "vertex_ai/claude-opus-4-6",
+            "bedrock/anthropic.claude-opus-4-6-v1:0",
+            "bedrock/us.anthropic.claude-opus-4-6-v1:0",
+            "bedrock/au.anthropic.claude-opus-4-6-v1:0",
+            "bedrock/eu.anthropic.claude-opus-4-6-v1:0",
+            "bedrock/jp.anthropic.claude-opus-4-6-v1:0",
+            "bedrock/global.anthropic.claude-opus-4-6-v1:0",
+        }
+        actual_thinking_aliases = {k for k in CLAUDE_EXTENDED_THINKING_MODELS if "claude-opus-4-6" in k}
+        assert actual_thinking_aliases == expected_thinking_aliases
+
+        # Negative checks: apac and dated variants NOT in extended thinking
+        assert "bedrock/apac.anthropic.claude-opus-4-6-v1:0" not in CLAUDE_EXTENDED_THINKING_MODELS
+        assert "claude-opus-4-6-20260120" not in CLAUDE_EXTENDED_THINKING_MODELS
+        assert "anthropic/claude-opus-4-6-20260120" not in CLAUDE_EXTENDED_THINKING_MODELS
+        assert "vertex_ai/claude-opus-4-6@20260120" not in CLAUDE_EXTENDED_THINKING_MODELS
+
+    def test_claude_model_family_metadata_key_validation(self):
+        """Regression test for validating Claude model family metadata keys.
+
+        Proves:
+        - all current shipped families validate successfully.
+        - an unknown top-level key (e.g. 'bedrock_region') raises ValueError naming the key and model_id.
+        - an unknown nested extra_aliases key (e.g. 'extended_thinkin') raises ValueError with key, alias, and model_id.
+        - global family definitions are not mutated.
+        """
+        # All current shipped families must pass validation
+        for fam in _CLAUDE_MODEL_FAMILIES:
+            _validate_claude_model_family(fam)
+
+        # 1. Copied family with unknown top-level key must raise ValueError
+        bad_fam = dict(_CLAUDE_MODEL_FAMILIES[0])
+        bad_fam["bedrock_region"] = ("global", "us")
+
+        with pytest.raises(ValueError) as exc_info:
+            _validate_claude_model_family(bad_fam)
+
+        err_msg = str(exc_info.value)
+        assert "bedrock_region" in err_msg
+        assert bad_fam["model_id"] in err_msg
+
+        # Generator must also reject the unknown top-level key when expanding
+        with pytest.raises(ValueError) as exc_info_gen:
+            _generate_claude_registries(families=[bad_fam])
+        assert "bedrock_region" in str(exc_info_gen.value)
+        assert bad_fam["model_id"] in str(exc_info_gen.value)
+
+        # 2. Family with unknown nested extra_aliases key must raise ValueError
+        bad_nested_fam = {
+            "model_id": "claude-opus-4-6",
+            "extra_aliases": {
+                "some/alias": {
+                    "max_tokens": 200000,
+                    "extended_thinkin": True,
+                }
+            },
+        }
+
+        with pytest.raises(ValueError) as exc_info_nested:
+            _validate_claude_model_family(bad_nested_fam)
+
+        err_nested = str(exc_info_nested.value)
+        assert "extended_thinkin" in err_nested
+        assert "some/alias" in err_nested
+        assert "claude-opus-4-6" in err_nested
+
+        # Generator must also reject the unknown nested key
+        with pytest.raises(ValueError) as exc_info_gen_nested:
+            _generate_claude_registries(families=[bad_nested_fam])
+        assert "extended_thinkin" in str(exc_info_gen_nested.value)
+        assert "some/alias" in str(exc_info_gen_nested.value)
+        assert "claude-opus-4-6" in str(exc_info_gen_nested.value)
+
+        # Ensure global families list was not mutated
+        assert "bedrock_region" not in _CLAUDE_MODEL_FAMILIES[0]
+
+    def test_claude_exceptional_extra_alias_capabilities(self):
+        """Prove exceptional extra-alias capability routing.
+
+        Proves:
+        - scalar int extra_aliases only populate token counts.
+        - structured extra_aliases route to extended_thinking when flagged.
+        - capability flags do not bleed to unrelated aliases.
+        """
+        synthetic_family = {
+            "model_id": "test-claude-synthetic",
+            "max_tokens": 500000,
+            "bedrock": False,
+            "vertex": False,
+            "extra_aliases": {
+                "test/extra-token-only": 500000,
+                "test/extra-thinking": {
+                    "max_tokens": 500000,
+                    "extended_thinking": True,
+                },
+            },
+        }
+
+        tokens, thinking = _generate_claude_registries(families=[synthetic_family])
+
+        # Token verification
+        assert tokens["test-claude-synthetic"] == 500000
+        assert tokens["anthropic/test-claude-synthetic"] == 500000
+        assert tokens["test/extra-token-only"] == 500000
+        assert tokens["test/extra-thinking"] == 500000
+
+        # Extended-thinking capability routing (no bleed)
+        assert "test/extra-thinking" in thinking
+        assert "test/extra-token-only" not in thinking
+
+    def test_claude_registries_baseline_parity_and_no_duplicates(self):
+        """Verify baseline capability parity and that no duplicate entries exist."""
+        # Capability lists have no duplicates
+        assert len(CLAUDE_EXTENDED_THINKING_MODELS) == len(set(CLAUDE_EXTENDED_THINKING_MODELS))
+
+    @pytest.mark.parametrize(
+        "model, expected",
+        [
+            ("gpt-4o", 128000),
+            ("gpt-4.1", 1047576),
+        ],
+    )
+    def test_ignore_max_model_tokens_returns_unreduced_litellm_value(self, monkeypatch, model, expected):
+        """Sites that bypass the max_model_tokens clamp (pr_help_message, pr_help_docs,
+        pr_code_suggestions) must still get the raw model context even after the exact
+        LiteLLM duplicates left the registry: the value now resolves from LiteLLM, while
+        the default path keeps clamping to config.max_model_tokens."""
+        fake_settings = type('', (), {
+            'config': type('', (), {
+                'custom_model_max_tokens': 0,
+                'max_model_tokens': 32000
+            })()
+        })()
+
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(token_budget, "MAX_TOKENS", {})  # simulate deletion of the entry
+
+        assert get_max_tokens(model) == 32000
+        assert get_max_tokens(model, ignore_max_model_tokens=True) == expected
+
+
+class TestNoLiteLLMDuplicates:
+
+    # Models pinned in MAX_TOKENS because LiteLLM's bundled backup cost map (used
+    # when the import-time fetch fails, and under LITELLM_LOCAL_MODEL_COST_MAP=true)
+    # does not carry them, so the get_max_tokens() fallback cannot resolve them.
+    # They are exempt from the no-duplicates guard by design.
+    LITELLM_BUNDLED_MAP_UNKNOWN = {
+        "gemini/gemini-3.8-flash",
+        "vertex_ai/gemini-3.8-flash",
+        "openrouter/x-ai/grok-4.5",
+        "openrouter/x-ai/grok-4.6",
+        "xai/grok-build-latest",
+        "zai/glm-5.2",
+    }
+
+    # The models issue #3196 found pinned more than 10% below LiteLLM's reported
+    # context window. zai/glm-5.2 is covered by test_zai_glm_5_2_model_max_tokens
+    # (kept pinned, absent from the bundled cost map); gpt-5.4 / gpt-5.4-2026-03-05
+    # are excluded because their 272000 pin is a documented safe default.
+    AUDITED_UNDERSTATED_MODELS = [
+        "mistral/mistral-medium-latest",
+        "mistral/mistral-small-latest",
+        "mistral/codestral-latest",
+        "mistral/open-mixtral-8x22b",
+        "mistral/mistral-large-latest",
+        "mistral/open-mistral-7b",
+        "mistral/open-mixtral-8x7b",
+        "codestral/codestral-latest",
+        "codestral/codestral-2405",
+        "watsonx/mistralai/mistral-large",
+        "moonshot/kimi-k3",
+        "deepseek/deepseek-reasoner",
+        "deepinfra/deepseek-ai/DeepSeek-R1",
+        "gpt-5",
+        "gpt-5-2025-08-07",
+        "gpt-5-nano",
+        "gpt-5-mini",
+        "gpt-5.1",
+        "gpt-5.1-2025-11-13",
+        "gpt-5.1-codex",
+        "gpt-5.1-codex-mini",
+        "ollama/llama3",
+    ]
+
+    @pytest.mark.parametrize("model", AUDITED_UNDERSTATED_MODELS)
+    def test_previously_understated_models_now_resolve_correctly(self, monkeypatch, model):
+        """Regression guard for issue #3196.
+
+        A static MAX_TOKENS entry takes precedence over the LiteLLM fallback, so a
+        pin below LiteLLM's max_input_tokens silently shrinks the usable context.
+        Compare against LiteLLM live rather than a copied number, so a LiteLLM
+        upgrade that raises a window does not fail this test.
+        """
+        fake_settings = type("", (), {
+            "config": type("", (), {
+                "custom_model_max_tokens": 0,
+                "max_model_tokens": 0
+            })()
+        })()
+        monkeypatch.setattr(token_budget, "get_settings", lambda: fake_settings)
+
+        litellm_max = int(litellm.get_model_info(model)["max_input_tokens"])
+        assert get_max_tokens(model) >= litellm_max
+
+    def test_static_max_tokens_has_no_exact_litellm_duplicates(self):
+        """Hardcoded MAX_TOKENS entries must not just mirror LiteLLM.
+
+        get_max_tokens() already falls back to litellm.get_model_info(), so a
+        static entry that reports the identical value is dead duplication.
+        Generator-expanded Claude families are excluded: they also drive the
+        extended-thinking registry, and their 1M-context handling is a separate,
+        deliberate judgement (issue #3196). Entries in
+        LITELLM_BUNDLED_MAP_UNKNOWN are pinned because the bundled cost map does
+        not carry them, so the fallback could not resolve them.
+        """
+        generated = set(_generate_claude_registries()[0])
+        static = {
+            k: v
+            for k, v in MAX_TOKENS.items()
+            if k not in generated and k not in self.LITELLM_BUNDLED_MAP_UNKNOWN
+        }
+        dups = []
+        for model, ours in static.items():
+            try:
+                theirs = int(litellm.get_model_info(model).get("max_input_tokens"))
+            except Exception:
+                continue
+            if theirs == ours:
+                dups.append((model, ours))
+        assert not dups, f"MAX_TOKENS entries that exactly duplicate LiteLLM: {sorted(dups)}"
