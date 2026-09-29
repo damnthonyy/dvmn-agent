@@ -1,3 +1,8 @@
+---
+title: "BitBucket Integration"
+sidebar_position: 6
+---
+
 ## Run as a Bitbucket Pipeline
 
 You can use the Bitbucket Pipeline system to run PR-Agent on every pull request open or update.
@@ -27,6 +32,12 @@ You can get a Bitbucket token for your repository by following Repository Settin
 For basic auth, you can generate a base64 encoded token from your username:password combination.
 
 Note that comments on a PR are not supported in Bitbucket Pipeline.
+
+### Persistent comments on Bitbucket Cloud
+
+Review and code-suggestion identity markers use invisible Markdown link references on Bitbucket Cloud.
+Existing comments with older HTML identity markers are still recognized and updated in place.
+No configuration change is required.
 
 ## Bitbucket Server and Data Center
 
@@ -67,8 +78,16 @@ python cli.py --pr_url https://git.on-prem-instance-of-bitbucket.com/projects/PR
 To run PR-Agent as webhook, build the docker image:
 
 ```bash
+<<<<<<< HEAD
 docker build . -t pragent/dvmn-agent:bitbucket_server_webhook --target bitbucket_server_webhook -f docker/Dockerfile
 docker push pragent/dvmn-agent:bitbucket_server_webhook  # Push to your Docker repository
+=======
+docker build . -t pr-agent:bitbucket_server_webhook --target bitbucket_server_webhook -f docker/Dockerfile
+
+# Optional, to push it to your own Docker repository:
+docker tag pr-agent:bitbucket_server_webhook <your-registry>/pr-agent:bitbucket_server_webhook
+docker push <your-registry>/pr-agent:bitbucket_server_webhook
+>>>>>>> upstream/main
 ```
 
 Navigate to `Projects` or `Repositories`, `Settings`, `Webhooks`, `Create Webhook`.
