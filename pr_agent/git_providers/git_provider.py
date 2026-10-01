@@ -1,16 +1,216 @@
+<<<<<<< HEAD
 # enum EDIT_TYPE (ADDED, DELETED, MODIFIED, RENAMED)
+=======
+import base64
+import json
+>>>>>>> upstream/main
 import os
+import re
 import shutil
 import subprocess
+<<<<<<< HEAD
 from abc import ABC, abstractmethod
 from typing import Optional, Tuple
+=======
+import time
+from abc import ABC, abstractmethod
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
+from typing import Any, Optional, Tuple
+from urllib.parse import urlsplit
+>>>>>>> upstream/main
 
+from pr_agent.algo.comment_identity import (
+    PRCommandNoticeIdentity,
+    add_pr_review_identity,
+    comment_carries_other_identity,
+    comment_matches_identity,
+    render_hidden_marker,
+)
+from pr_agent.algo.inline_comment_dedup import strip_markers
+from pr_agent.algo.language_handler import build_language_file_matcher, numeric_languages
 from pr_agent.algo.types import FilePatchInfo
 from pr_agent.algo.utils import Range, process_description
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
 
+
+def get_config_branch() -> str:
+    """Return the branch to read the repo `.pr_agent.toml` from, or "" for the provider default branch.
+
+    Prefer CONFIG.CONFIG_BRANCH (set by the CLI `--config-branch` flag) over the
+    PR_AGENT_CONFIG_BRANCH environment variable and ignore whitespace-only values.
+    """
+    settings_branch = get_settings().get("CONFIG.CONFIG_BRANCH", None)
+    settings_branch = settings_branch.strip() if isinstance(settings_branch, str) else ""
+    env_branch = (os.environ.get("PR_AGENT_CONFIG_BRANCH") or "").strip()
+    return settings_branch or env_branch
+
+
 MAX_FILES_ALLOWED_FULL = 50
+
+DEFAULT_DISCUSSION_CONTEXT_CHARS = 24000
+DISCUSSION_CONTEXT_MAX_REPLIES = 10
+DISCUSSION_CONTEXT_MAX_THREADS = 50
+DISCUSSION_CONTEXT_MAX_MESSAGE_CHARS = 750
+
+
+@dataclass
+class CodeSuggestionThread:
+    """One prior code-suggestion thread, as a provider reports it for the /improve discussion context.
+
+    `suggestion` is the raw opener body. `replies` holds (author, message) pairs, oldest first, with
+    provider-specific noise (system notes, progress messages) already removed. `authored_by_agent` is
+    None when the provider cannot verify who opened the thread.
+    """
+    thread_id: Any
+    status: Any
+    file: Optional[str]
+    start_line: Optional[int]
+    end_line: Optional[int]
+    suggestion: str
+    replies: list[tuple[str, str]] = field(default_factory=list)
+    authored_by_agent: Optional[bool] = None
+
+
+def _discussion_context_budget() -> int:
+    value = get_settings().get("pr_code_suggestions.max_discussion_context_chars", DEFAULT_DISCUSSION_CONTEXT_CHARS)
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        get_logger().warning(f"Invalid pr_code_suggestions.max_discussion_context_chars: {value!r}")
+        return DEFAULT_DISCUSSION_CONTEXT_CHARS
+
+
+class IncompleteProviderPullRequestFilesError(RuntimeError):
+    """Provider-neutral base for incomplete-file failures with public notices."""
+
+    notice: str
+    notice_marker: str
+
+
+class IncompletePullRequestFilesError(IncompleteProviderPullRequestFilesError):
+    """Represent an incomplete or inconsistent GitHub pull-request file set."""
+
+    notice = (
+        "## PR-Agent command was not run\n\n"
+        "GitHub returned an incomplete or inconsistent changed-file set for this pull request, so PR-Agent stopped "
+        "instead of analyzing only part of it.\n\n"
+        "GitHub limits changed-file responses to 3,000 files. If this pull request changes more than 3,000 files, "
+        "split it into smaller pull requests and run the command again. Otherwise, retry the command."
+    )
+    notice_marker = "<!-- pr-agent:github-incomplete-files -->"
+
+
+class IncompleteBitbucketPullRequestFilesError(IncompleteProviderPullRequestFilesError):
+    """Represent Bitbucket aggregate patches that cannot align with its changed-file inventory."""
+
+    notice = (
+        "## PR-Agent command was not run\n\n"
+        "Bitbucket returned an incomplete or inconsistent pull-request diff, so PR-Agent stopped "
+        "instead of treating it as an empty change.\n\n"
+        "Retry the command and check the pull request's diff in Bitbucket if the problem persists."
+    )
+    notice_marker = PRCommandNoticeIdentity.INCOMPLETE_BITBUCKET_FILES.value
+
+
+@dataclass(frozen=True)
+class FileContentSnapshot:
+    """Capture file contents and existence at one revision for a guarded write.
+
+    The revision is opaque and provider-owned; consumers must not interpret or refresh it.
+    """
+    contents: str
+    exists: bool
+    revision: str | None
+
+
+class ConcurrentFileUpdateError(RuntimeError):
+    """Signal that a file no longer matches the snapshot used to prepare its replacement."""
+
+
+_URL_USERINFO_RE = re.compile(r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.\-]{0,30}://)[^/@\s]+@")
+_AUTH_HEADER_RE = re.compile(r"(?i)(authorization\s*:\s*(?:bearer|basic|token)\s+)\S+")
+
+
+# The reaction PR-Agent has always added when it picks a comment command up. Used as the
+# fallback for `reaction_on_start` so that a deployment whose configuration.toml predates
+# these settings keeps acknowledging comments instead of silently going quiet.
+DEFAULT_START_REACTION = "eyes"
+
+
+def get_reaction_setting(name: str, default: str = "") -> str:
+    """Read one `config.reaction_*` setting as a stripped string.
+
+    `default` applies only when the key is absent. A key that is present but unusable - empty,
+    or not a string - means the operator asked for no reaction, so "" is returned.
+    """
+    value = get_settings().config.get(name, default)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def redact_credentials(text) -> str:
+    if not text:
+        return ""
+    redacted = _URL_USERINFO_RE.sub(lambda m: m.group("scheme"), str(text))
+    return _AUTH_HEADER_RE.sub(lambda m: m.group(1) + "<redacted>", redacted)
+
+
+def _clone_authorization_header(repo_url: str) -> str | None:
+    """Build the Authorization header git should send for a token-bearing clone URL.
+
+    Replicates what a plain `git clone https://user[:password]@host/...` would have sent
+    via curl so the credential can ride in the environment instead of the `git` or
+    `git-remote-http` command lines. Returns None when `repo_url` carries no userinfo.
+    """
+    parsed = urlsplit(repo_url)
+    if parsed.username is None:
+        return None
+    credentials = f"{parsed.username}:" if parsed.password is None else f"{parsed.username}:{parsed.password}"
+    encoded = base64.b64encode(credentials.encode("utf-8")).decode("ascii")
+    return f"Authorization: Basic {encoded}"
+
+_GLOBAL_SETTINGS_CACHE: dict = {}
+_GLOBAL_SETTINGS_CACHE_TTL_SECONDS = 15 * 60
+_GLOBAL_SETTINGS_CACHE_MAX_SIZE = 256
+# Only cache reasonably-sized settings blobs; a valid .pr_agent.toml is tiny. This bounds the
+# process-wide cache memory (256 entries x this) regardless of the much larger apply-time size cap.
+_GLOBAL_SETTINGS_CACHE_MAX_VALUE_BYTES = 1024 * 1024
+
+
+def get_cached_global_settings(cache_key, fetch_fn):
+    """Return the org/group/workspace global .pr_agent.toml via a bounded TTL cache.
+
+    Global settings change rarely, so caching avoids a provider API lookup (and repeated
+    403/404 fallbacks) on every webhook event. Empty/"not found" results are cached too, to
+    prevent repeated failed lookups. Oversized values are returned but not cached (to bound
+    memory). Pass a falsy cache_key to bypass the cache.
+    """
+    def _fetch_safely():
+        # A transient/unexpected fetch failure must NOT be cached, so it is retried instead of
+        # disabling global settings for the whole TTL. fetch_fn returns "" for expected "not found".
+        try:
+            return fetch_fn(), True
+        except Exception as e:
+            get_logger().warning(f"Failed to load global settings, error: {e}")
+            return "", False
+
+    if not cache_key:
+        return _fetch_safely()[0]
+    now = time.monotonic()
+    entry = _GLOBAL_SETTINGS_CACHE.get(cache_key)
+    if entry is not None and entry[1] > now:
+        return entry[0]
+    value, cacheable = _fetch_safely()
+    if not cacheable:
+        return value
+    value_size = len(value) if isinstance(value, (bytes, str)) else 0
+    if value_size <= _GLOBAL_SETTINGS_CACHE_MAX_VALUE_BYTES:
+        _GLOBAL_SETTINGS_CACHE[cache_key] = (value, now + _GLOBAL_SETTINGS_CACHE_TTL_SECONDS)
+        while len(_GLOBAL_SETTINGS_CACHE) > _GLOBAL_SETTINGS_CACHE_MAX_SIZE:
+            oldest_key = min(_GLOBAL_SETTINGS_CACHE, key=lambda k: _GLOBAL_SETTINGS_CACHE[k][1])
+            _GLOBAL_SETTINGS_CACHE.pop(oldest_key, None)
+    return value
 
 def get_git_ssl_env() -> dict[str, str]:
     """
@@ -29,29 +229,32 @@ def get_git_ssl_env() -> dict[str, str]:
         if os.path.exists(ssl_cert_file):
             if ((requests_ca_bundle and requests_ca_bundle != ssl_cert_file)
                     or (git_ssl_ca_info and git_ssl_ca_info != ssl_cert_file)):
-                get_logger().warning(f"Found mismatch among: SSL_CERT_FILE, REQUESTS_CA_BUNDLE, GIT_SSL_CAINFO. "
-                                     f"Using the SSL_CERT_FILE to resolve ambiguity.",
+                get_logger().warning("Found mismatch among: SSL_CERT_FILE, REQUESTS_CA_BUNDLE, GIT_SSL_CAINFO. "
+                                     "Using the SSL_CERT_FILE to resolve ambiguity.",
                                   artifact={"ssl_cert_file": ssl_cert_file, "requests_ca_bundle": requests_ca_bundle,
                                             'git_ssl_ca_info': git_ssl_ca_info})
             else:
-                get_logger().info(f"Using SSL certificate bundle for git operations", artifact={"ssl_cert_file": ssl_cert_file})
+                get_logger().info("Using SSL certificate bundle for git operations",
+                                  artifact={"ssl_cert_file": ssl_cert_file})
             chosen_cert_file = ssl_cert_file
         else:
-            get_logger().warning("SSL certificate bundle not found for git operations", artifact={"ssl_cert_file": ssl_cert_file})
+            get_logger().warning("SSL certificate bundle not found for git operations",
+                                 artifact={"ssl_cert_file": ssl_cert_file})
 
     # Fallback to REQUESTS_CA_BUNDLE
     elif requests_ca_bundle:
         if os.path.exists(requests_ca_bundle):
             if (git_ssl_ca_info and git_ssl_ca_info != requests_ca_bundle):
-                get_logger().warning(f"Found mismatch between: REQUESTS_CA_BUNDLE, GIT_SSL_CAINFO. "
-                                     f"Using the REQUESTS_CA_BUNDLE to resolve ambiguity.",
+                get_logger().warning("Found mismatch between: REQUESTS_CA_BUNDLE, GIT_SSL_CAINFO. "
+                                     "Using the REQUESTS_CA_BUNDLE to resolve ambiguity.",
                 artifact = {"requests_ca_bundle": requests_ca_bundle, 'git_ssl_ca_info': git_ssl_ca_info})
             else:
                 get_logger().info("Using SSL certificate bundle from REQUESTS_CA_BUNDLE for git operations",
                                   artifact={"requests_ca_bundle": requests_ca_bundle})
             chosen_cert_file = requests_ca_bundle
         else:
-            get_logger().warning("requests CA bundle not found for git operations", artifact={"requests_ca_bundle": requests_ca_bundle})
+            get_logger().warning("requests CA bundle not found for git operations",
+                                 artifact={"requests_ca_bundle": requests_ca_bundle})
 
     #Fallback to GIT CA:
     elif git_ssl_ca_info:
@@ -60,10 +263,12 @@ def get_git_ssl_env() -> dict[str, str]:
                               artifact={"git_ssl_ca_info": git_ssl_ca_info})
             chosen_cert_file = git_ssl_ca_info
         else:
-            get_logger().warning("git SSL CA info not found for git operations", artifact={"git_ssl_ca_info": git_ssl_ca_info})
+            get_logger().warning("git SSL CA info not found for git operations",
+                                 artifact={"git_ssl_ca_info": git_ssl_ca_info})
 
     else:
-        get_logger().warning("Neither SSL_CERT_FILE nor REQUESTS_CA_BUNDLE nor GIT_SSL_CAINFO are defined, or they are defined but not found. Returning environment without SSL configuration")
+        get_logger().warning("Neither SSL_CERT_FILE nor REQUESTS_CA_BUNDLE nor GIT_SSL_CAINFO are defined, "
+                             "or they are defined but not found. Returning environment without SSL configuration")
 
     returned_env = os.environ.copy()
     if chosen_cert_file:
@@ -76,14 +281,164 @@ class GitProvider(ABC):
     def is_supported(self, capability: str) -> bool:
         pass
 
-    #Given a url (issues or PR/MR) - get the .git repo url to which they belong. Needs to be implemented by the provider.
+    def reset_diff_cache_for_command(self) -> None:
+        """Reset diff state that should not survive an automatic command boundary."""
+        if getattr(self, "diff_files", None) == []:
+            self.diff_files = None
+
+    def supports_incremental_kind(self, kind: str) -> bool:
+        """Whether `get_incremental_commits()` can scope an incremental run to `kind`
+        (e.g. "suggestions" for `/improve -i`). Providers implementing kind-aware
+        incremental anchoring override this; the default is no support, so tools
+        fall back to a full run."""
+        return False
+
+    def supports_code_suggestions_artifact(self) -> bool:
+        """Return whether `publish_code_suggestions()` writes a standalone output artifact."""
+        return False
+
+    def supports_comment_publish_confirmation(self) -> bool:
+        """Return whether `publish_comment()` returns a comment object on success.
+
+        Providers that return a comment object on success and `None` on a permanent
+        publication failure report `True`. Providers that publish to local sinks
+        (e.g. gerrit, local git, plain-diff) return `None` even after a successful
+        publish and report `False`, so callers normalize a `None` return accordingly.
+        """
+        return True
+
+    def publish_code_suggestions_artifact(
+            self, code_suggestions: list, artifact_footer: str = "",
+            no_suggestions_message: str = "No code suggestions found for the PR.") -> bool:
+        """Publish suggestions to a standalone artifact, optionally with additional context.
+
+        Providers that return True from `supports_code_suggestions_artifact()` should override
+        this method when they can preserve the footer in the same artifact. The default keeps
+        backward compatibility for providers that only implement `publish_code_suggestions()`.
+        """
+        return self.publish_code_suggestions(code_suggestions)
+
+    def supports_code_suggestion_state(self) -> bool:
+        return False
+
+    def get_code_suggestion_thread_context(self) -> str:
+        """Return prior code-suggestion threads as a JSON block for the /improve prompt.
+
+        Threads come newest first from `_iter_code_suggestion_threads()`. The block stays within
+        `pr_code_suggestions.max_discussion_context_chars` (0 disables it) and is empty when no thread fits.
+        """
+        budget = _discussion_context_budget()
+        if budget <= 0:
+            return ""
+        discussions, context = [], ""
+        for thread in self._iter_code_suggestion_threads():
+            if thread.authored_by_agent is False:
+                continue
+            replies = [(author, message.strip()) for author, message in thread.replies
+                       if isinstance(message, str) and message.strip()]
+            discussion = {
+                "thread_id": thread.thread_id,
+                "status": thread.status,
+                "file": thread.file,
+                "start_line": thread.start_line,
+                "end_line": thread.end_line,
+                "suggestion": strip_markers(thread.suggestion).strip()[:DISCUSSION_CONTEXT_MAX_MESSAGE_CHARS],
+                "replies": [{"author": author or "Unknown", "message": message[:DISCUSSION_CONTEXT_MAX_MESSAGE_CHARS]}
+                            for author, message in replies[-DISCUSSION_CONTEXT_MAX_REPLIES:]],
+            }
+            candidate = json.dumps(discussions + [discussion], ensure_ascii=False, indent=2)
+            if len(candidate) > budget:
+                break
+            discussions.append(discussion)
+            context = candidate
+            if len(discussions) >= DISCUSSION_CONTEXT_MAX_THREADS:
+                break
+        return context
+
+    def _iter_code_suggestion_threads(self) -> Iterator[CodeSuggestionThread]:
+        """Yield prior code-suggestion threads, newest first. Providers with suggestion state override this."""
+        return iter(())
+
+    def supports_threaded_pr_questions(self) -> bool:
+        return False
+
+    def supports_line_question_history(self) -> bool:
+        return False
+
+    def supports_checkbox_commands(self) -> bool:
+        """Whether a published comment renders command checkboxes as checkboxes.
+
+        Providers that render `- [ ]` as a tickable box override this; the default is no
+        support, so tools render commands as text instead."""
+        return False
+
+    def supports_pr_chat(self) -> bool:
+        """Whether this provider is compatible with the linked PR-Agent browser-extension chat experience."""
+        return False
+
+    @classmethod
+    def supports_issue_indexing(cls) -> bool:
+        """Whether `/similar_issue` can read and index this provider's issues.
+
+        Declared on the class rather than on an instance because the tool consults it before
+        constructing a provider: `PRSimilarIssue` needs to know whether to build one at all.
+        The indexing path relies on issue listing, issue bodies and issue comments, so a
+        provider that exposes those overrides this; the default is no support, so the tool
+        reports the command as unsupported instead of failing part-way through.
+        """
+        return False
+
+    def supports_inline_help_footer(self) -> bool:
+        """Whether the `/describe` help footer is rendered as an inline `<li>` list.
+
+        Scoped to that footer's layout, not to HTML lists in general: the changes
+        walkthrough already emits `<ul>` and `<li>` for every provider that passes the
+        `gfm_markdown` gate. Providers whose `<details>` summary renders a sibling `<li>`
+        inline override this; the default falls back to `<br>`-separated bullets."""
+        return False
+
+    def supports_changelog_update_review(self) -> bool:
+        """Whether a pushed CHANGELOG.md commit can be annotated with a PR review.
+
+        `/update_changelog --push_changelog_changes=true` posts its summary as a review on the
+        commit it just pushed. Providers exposing a commit-scoped review API override this;
+        the default is no support, so the review is simply skipped.
+        """
+        return False
+
+    def supports_markdown_tables(self) -> bool:
+        """Whether comments render pipe-table markdown.
+
+        Only consulted for providers without `gfm_markdown`, so that tools can degrade to
+        a plain table instead of refusing to render. Providers that render Markdown tables
+        but not GitHub-flavored markdown override this."""
+        return False
+
+    def supports_issue_url_tickets(self) -> bool:
+        """Tickets are linked as issue URLs in the PR description or branch name."""
+        return False
+
+    def supports_issue_reference_tickets(self) -> bool:
+        """Tickets are linked as project-scoped issue references (e.g. group/project#12)."""
+        return False
+
+    def supports_linked_work_item_tickets(self) -> bool:
+        """Tickets come from work items the platform links to the PR itself."""
+        return False
+
+    #Given a url (issues or PR/MR) - get the .git repo url to which they belong.
+    #Needs to be implemented by the provider.
     def get_git_repo_url(self, issues_or_pr_url: str) -> str:
         get_logger().warning("Not implemented! Returning empty url")
         return ""
 
-    # Given a git repo url, return prefix and suffix of the provider in order to view a given file belonging to that repo. Needs to be implemented by the provider.
-    # For example: For a git: https://git_provider.com/MY_PROJECT/MY_REPO.git and desired branch: <MY_BRANCH> then it should return ('https://git_provider.com/projects/MY_PROJECT/repos/MY_REPO/.../<MY_BRANCH>', '?=<SOME HEADER>')
-    # so that to properly view the file: docs/readme.md -> <PREFIX>/docs/readme.md<SUFFIX> -> https://git_provider.com/projects/MY_PROJECT/repos/MY_REPO/<MY_BRANCH>/docs/readme.md?=<SOME HEADER>)
+    # Given a git repo url, return prefix and suffix of the provider in order to view a given
+    # file belonging to that repo. Needs to be implemented by the provider.
+    # For example: For a git: https://git_provider.com/MY_PROJECT/MY_REPO.git and desired branch:
+    # <MY_BRANCH> then it should return
+    # ('https://git_provider.com/projects/MY_PROJECT/repos/MY_REPO/.../<MY_BRANCH>', '?=<SOME HEADER>')
+    # so that to properly view the file: docs/readme.md -> <PREFIX>/docs/readme.md<SUFFIX> ->
+    # https://git_provider.com/projects/MY_PROJECT/repos/MY_REPO/<MY_BRANCH>/docs/readme.md?=<SOME HEADER>)
     def get_canonical_url_parts(self, repo_git_url:str, desired_branch:str) -> Tuple[str, str]:
         get_logger().warning("Not implemented! Returning empty prefix and suffix")
         return ("", "")
@@ -93,7 +448,8 @@ class GitProvider(ABC):
     #An object which ensures deletion of a cloned repo, once it becomes out of scope.
     # Example usage:
     #    with TemporaryDirectory() as tmp_dir:
-    #            returned_obj: GitProvider.ScopedClonedRepo = self.git_provider.clone(self.repo_url, tmp_dir, remove_dest_folder=False)
+    #            returned_obj: GitProvider.ScopedClonedRepo = self.git_provider.clone(
+    #                self.repo_url, tmp_dir, remove_dest_folder=False)
     #            print(returned_obj.path) #Use returned_obj.path.
     #    #From this point, returned_obj.path may be deleted at any point and therefore must not be used.
     class ScopedClonedRepo(object):
@@ -104,18 +460,15 @@ class GitProvider(ABC):
             if self.path and os.path.exists(self.path):
                 shutil.rmtree(self.path, ignore_errors=True)
 
-    #Method to allow implementors to manipulate the repo url to clone (such as embedding tokens in the url string). Needs to be implemented by the provider.
+    #Method to allow implementors to manipulate the repo url to clone (such as embedding tokens
+    #in the url string). Needs to be implemented by the provider.
     def _prepare_clone_url_with_token(self, repo_url_to_clone: str) -> str | None:
         get_logger().warning("Not implemented! Returning None")
         return None
 
-    # Does a shallow clone, using a forked process to support a timeout guard.
-    # In case operation has failed, it is expected to throw an exception as this method does not return a value.
+    # Run a shallow, blob-filtered clone in a subprocess so the timeout can terminate the operation.
+    # Failures propagate to clone(), which handles and logs them.
     def _clone_inner(self, repo_url: str, dest_folder: str, operation_timeout_in_seconds: int=None) -> None:
-        #The following ought to be equivalent to:
-        # #Repo.clone_from(repo_url, dest_folder)
-        # , but with throwing an exception upon timeout.
-        # Note: This can only be used in context that supports using pipes.
         try:
             ssl_env = get_git_ssl_env()
         except Exception as e:
@@ -125,11 +478,26 @@ class GitProvider(ABC):
             )
             ssl_env = os.environ.copy()
 
+        # Keep the credential out of every git argv: clone the redacted URL and resend the
+        # token as an http.extraHeader through the GIT_CONFIG_* environment. Git applies
+        # that config to the subprocesses it spawns (including git-remote-http) without
+        # putting the credential on any command line.
+        clean_repo_url = redact_credentials(repo_url)
+        authorization_header = _clone_authorization_header(repo_url)
+        if clean_repo_url != repo_url and authorization_header is not None:
+            inherited_count = int(ssl_env.get("GIT_CONFIG_COUNT", "0"))
+            ssl_env = {
+                **ssl_env,
+                f"GIT_CONFIG_KEY_{inherited_count}": "http.extraHeader",
+                f"GIT_CONFIG_VALUE_{inherited_count}": authorization_header,
+                "GIT_CONFIG_COUNT": str(inherited_count + 1),
+            }
+
         subprocess.run([
             "git", "clone",
             "--filter=blob:none",
             "--depth", "1",
-            repo_url, dest_folder
+            clean_repo_url, dest_folder
         ], env=ssl_env, check=True,  # check=True will raise an exception if the command fails
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=operation_timeout_in_seconds)
 
@@ -143,20 +511,41 @@ class GitProvider(ABC):
         if not clone_url:
             get_logger().error("Clone failed: Unable to obtain url to clone.")
             return returned_obj
+        destination_existed = os.path.exists(dest_folder)
+        preexisting_git_dir = os.path.isdir(os.path.join(dest_folder, ".git"))
         try:
             if remove_dest_folder and os.path.exists(dest_folder) and os.path.isdir(dest_folder):
                 shutil.rmtree(dest_folder)
+                destination_existed = False
+                preexisting_git_dir = False
             self._clone_inner(clone_url, dest_folder, operation_timeout_in_seconds)
             returned_obj = GitProvider.ScopedClonedRepo(dest_folder)
         except Exception as e:
-            get_logger().exception(f"Clone failed: Could not clone url.",
-                artifact={"error": str(e), "url": clone_url, "dest_folder": dest_folder})
-        finally:
-            return returned_obj
+            # Remove Git metadata created by a failed clone; preserve caller-owned files when remove_dest_folder=False.
+            git_dir = os.path.join(dest_folder, ".git")
+            if os.path.isdir(git_dir) and not preexisting_git_dir:
+                shutil.rmtree(git_dir, ignore_errors=True)
+            if not destination_existed and os.path.isdir(dest_folder):
+                shutil.rmtree(dest_folder, ignore_errors=True)
+            get_logger().error("Clone failed: Could not clone url.",
+                artifact={"error": redact_credentials(e), "url": redact_credentials(clone_url),
+                          "dest_folder": dest_folder})
+        return returned_obj
 
     @abstractmethod
     def get_files(self) -> list:
         pass
+
+    def get_pr_file_paths(self) -> list:
+        """Return every repository-relative path the PR/MR touches, independent of
+        incremental review state, preserving rename metadata.
+
+        The default delegates to get_files(). Providers whose get_files() shrinks
+        to the unreviewed subset while an incremental review is active must
+        override this with a complete file-set listing, so per-directory settings
+        discovery does not depend on how much of the PR the review has covered.
+        """
+        return self.get_files()
 
     @abstractmethod
     def get_diff_files(self) -> list[FilePatchInfo]:
@@ -166,12 +555,69 @@ class GitProvider(ABC):
         pass
 
     @abstractmethod
-    def publish_description(self, pr_title: str, pr_body: str):
+    def publish_description(self, pr_title: str, pr_body: str) -> None:
+        """Publish the pull request title and description.
+
+        Implementations must raise when the remote update fails so callers do
+        not continue through a false-success path.
+        """
+        # pr_title may be None, which means "leave the existing title unchanged"
+        # and update only the description. Implementations must not write the
+        # title in that case.
         pass
 
-    @abstractmethod
     def publish_code_suggestions(self, code_suggestions: list) -> bool:
-        pass
+        """Publish code suggestions through provider-specific preparation and payload hooks."""
+        post_parameters_list = []
+        for suggestion in self._prepare_code_suggestions(code_suggestions):
+            suggestion = self._prepare_code_suggestion(suggestion)
+            if not suggestion:
+                continue
+            if not self._is_valid_code_suggestion(suggestion):
+                continue
+            post_parameters = self._build_code_suggestion_payload(suggestion)
+            if not post_parameters:
+                continue
+            post_parameters_list.append(post_parameters)
+
+        try:
+            return bool(self.publish_inline_comments(post_parameters_list))
+        except self._code_suggestion_publish_exceptions as e:
+            self._log_code_suggestion_publish_error(e)
+            return False
+
+    _code_suggestion_publish_exceptions = (Exception,)
+
+    def _prepare_code_suggestions(self, code_suggestions: list) -> list:
+        return code_suggestions
+
+    def _prepare_code_suggestion(self, suggestion: dict) -> dict | None:
+        return suggestion
+
+    def _is_valid_code_suggestion(self, suggestion: dict) -> bool:
+        relevant_lines_start = suggestion["relevant_lines_start"]
+        relevant_lines_end = suggestion["relevant_lines_end"]
+        if not relevant_lines_start or relevant_lines_start == -1:
+            self._log_invalid_code_suggestion(
+                f"Failed to publish code suggestion, relevant_lines_start is {relevant_lines_start}"
+            )
+            return False
+        if relevant_lines_end < relevant_lines_start:
+            self._log_invalid_code_suggestion(
+                f"Failed to publish code suggestion, relevant_lines_end is {relevant_lines_end} and "
+                f"relevant_lines_start is {relevant_lines_start}"
+            )
+            return False
+        return True
+
+    def _build_code_suggestion_payload(self, suggestion: dict) -> dict | None:
+        raise NotImplementedError
+
+    def _log_invalid_code_suggestion(self, message: str) -> None:
+        get_logger().exception(message)
+
+    def _log_code_suggestion_publish_error(self, error: Exception) -> None:
+        get_logger().error(f"Failed to publish code suggestion, error: {error}")
 
     @abstractmethod
     def get_languages(self):
@@ -192,17 +638,11 @@ class GitProvider(ABC):
     def edit_comment(self, comment, body: str):
         pass
 
-    def edit_comment_from_comment_id(self, comment_id: int, body: str):
-        pass
-
-    def get_comment_body_from_comment_id(self, comment_id: int) -> str:
-        pass
-
     def reply_to_comment_from_comment_id(self, comment_id: int, body: str):
         pass
 
     def get_pr_description(self, full: bool = True, split_changes_walkthrough=False) -> str | tuple:
-        from pr_agent.algo.utils import clip_tokens
+        from pr_agent.algo.token_budget import clip_tokens
         from pr_agent.config_loader import get_settings
         max_tokens_description = get_settings().get("CONFIG.MAX_DESCRIPTION_TOKENS", None)
         description = self.get_pr_description_full() if full else self.get_user_description()
@@ -217,16 +657,20 @@ class GitProvider(ABC):
             return description
 
     def get_user_description(self) -> str:
-        if hasattr(self, 'user_description') and not (self.user_description is None):
+        if hasattr(self, "user_description") and (self.user_description is not None):
             return self.user_description
 
         description = (self.get_pr_description_full() or "").strip()
         description_lowercase = description.lower()
-        get_logger().debug(f"Existing description", description=description_lowercase)
+        get_logger().debug("Existing description", description=description_lowercase)
 
         # if the existing description wasn't generated by the dvmn-agent, just return it as-is
         if not self._is_generated_by_pr_agent(description_lowercase):
+<<<<<<< HEAD
             get_logger().info(f"Existing description was not generated by the dvmn-agent")
+=======
+            get_logger().info("Existing description was not generated by the pr-agent")
+>>>>>>> upstream/main
             self.user_description = description
             return description
 
@@ -234,11 +678,21 @@ class GitProvider(ABC):
         # return nothing (empty string) because it means there is no user description
         user_description_header = "### **user description**"
         if user_description_header not in description_lowercase:
+<<<<<<< HEAD
             get_logger().info(f"Existing description was generated by the dvmn-agent, but it doesn't contain a user description")
             return ""
 
         # otherwise, extract the original user description from the existing dvmn-agent description and return it
         # user_description_start_position = description_lowercase.find(user_description_header) + len(user_description_header)
+=======
+            get_logger().info("Existing description was generated by the pr-agent, "
+                              "but it doesn't contain a user description")
+            return ""
+
+        # otherwise, extract the original user description from the existing pr-agent description and return it
+        # user_description_start_position = description_lowercase.find(user_description_header)
+        #     + len(user_description_header)
+>>>>>>> upstream/main
         # return description[user_description_start_position:].split("\n", 1)[-1].strip()
 
         # the 'user description' is in the beginning. extract and return it
@@ -257,28 +711,176 @@ class GitProvider(ABC):
             if original_user_description.lower().startswith(user_description_header):
                 original_user_description = original_user_description[len(user_description_header):].strip()
 
-        get_logger().info(f"Extracted user description from existing description",
+        get_logger().info("Extracted user description from existing description",
                           description=original_user_description)
         self.user_description = original_user_description
         return original_user_description
 
     def _possible_headers(self):
-        return ("### **user description**", "### **pr type**", "### **pr description**", "### **pr labels**", "### **type**", "### **description**",
-                "### **labels**", "### 🤖 generated by pr agent")
+        return ("### **user description**",
+                "### **pr type**",
+                "### **pr description**",
+                "### **pr labels**",
+                "### **type**",
+                "### **description**",
+                "### **labels**",
+                "### 🤖 generated by pr agent")
+
+    # Headers that are unique to pr-agent output; humans never write these
+    # naturally, so they can safely be matched anywhere in the body.
+    _UNIQUE_PR_AGENT_HEADERS = frozenset((
+        "### **user description**",
+        "### **pr type**",
+        "### **pr description**",
+        "### **pr labels**",
+        "### \U0001f916 generated by pr agent",
+    ))
 
     def _is_generated_by_pr_agent(self, description_lowercase: str) -> bool:
+        # Fast path: hidden HTML comment injected at write time.
+        if '<!-- pr-agent-generated -->' in description_lowercase:
+            return True
         possible_headers = self._possible_headers()
-        return any(description_lowercase.startswith(header) for header in possible_headers)
+        # For headers unique to pr-agent, tolerate leading content (the ratchet
+        # case from #2633: a description like "Fixes #42\n### **PR Type**" should
+        # still be recognized as pr-agent output).
+        for header in possible_headers:
+            # the header must start its own line: a quoted copy, e.g. inside a
+            # blockquote or backticks, is somebody else's text, not ours
+            if header in self._UNIQUE_PR_AGENT_HEADERS and (
+                    description_lowercase.startswith(header)
+                    or ("\n" + header) in description_lowercase):
+                return True
+        # For generic headers (type, description, labels), require startswith
+        # to avoid misclassifying human descriptions that happen to contain
+        # one of these common markdown headings.
+        return any(description_lowercase.startswith(header) for header in possible_headers
+                   if header not in self._UNIQUE_PR_AGENT_HEADERS)
 
     @abstractmethod
     def get_repo_settings(self):
         pass
 
-    def get_workspace_name(self):
+    def get_repo_settings_tree(self, ref: str = "") -> tuple[list[str], str]:
+        """Recursively list every `.pr_agent.toml` path at `ref` ("" = the repository
+        default branch) as `(paths, resolved_ref)`. Providers without per-directory
+        settings support return `([], "")` so the feature degrades to root-only
+        behavior. Implemented by GitHub and GitLab."""
+        return [], ""
+
+    def get_repo_settings_contents(self, paths: list[str], ref: str) -> dict[str, bytes]:
+        """Fetch the raw content of per-directory repo settings files at `ref`.
+
+        Only the entries whose content was fetched successfully are returned; a
+        missing file is skipped with a warning rather than failing the request.
+        Defaults to no per-directory support."""
+        return {}
+
+    def get_owning_namespace(self) -> Optional[str]:
+        """Return the org/group/workspace that owns this repository, or None when
+        the provider has no organisation-level home for global settings.
+
+        This is the hook that `_get_global_repo_settings` uses to decide which
+        namespace's `pr-agent-settings` repository (or equivalent) to consult.
+        Providers that support global settings override this; the default is None,
+        which disables global settings for the provider.
+        """
+        return None
+
+    def _get_global_repo_settings(self):
+        """Load the namespace-wide `pr-agent-settings` .pr_agent.toml, if enabled.
+
+        This is a concrete template: it gates on `use_global_settings_file`, resolves
+        the owning namespace via `get_owning_namespace()`, and delegates the actual
+        provider API call (and its 403/404 mapping) to `_fetch_global_repo_settings`,
+        all behind the shared TTL cache. Providers build the cache key through
+        `_get_global_settings_cache_key` so instance-specific keys (e.g. GitHub
+        enterprise hosts) stay distinct.
+        """
+        if not get_settings().config.use_global_settings_file:
+            return ""
+        namespace = self.get_owning_namespace()
+        if not namespace:
+            return ""
+        return get_cached_global_settings(
+            self._get_global_settings_cache_key(namespace),
+            lambda: self._fetch_global_repo_settings(namespace))
+
+    def _get_global_settings_cache_key(self, namespace: str) -> str:
+        """Cache key for a namespace's global settings.
+
+        Override to scope the key beyond the provider type (e.g. include a
+        self-hosted base URL so two instances hosting the same org don't collide).
+        """
+        return f"{type(self).__name__}:{namespace}"
+
+    def _fetch_global_repo_settings(self, namespace: str):
+        """Fetch the raw `.pr_agent.toml` from the namespace's `pr-agent-settings`
+        repository. Return "" for an expected "not found"/no-access result (so it is
+        cached) and let transient/unexpected errors propagate. Overridden per provider."""
         return ""
+
+    def get_repo_file_content(self, file_path: str, from_default_branch: bool = False):
+        return ""
+
+    def get_sibling_repo_file_content(self, repo_id: str, file_path: str, from_default_branch: bool = False):
+        """Fetch a single file from a sibling repository in the same namespace/owner.
+
+        Used by repo context when a repo_context_files entry is a
+        sibling dict ``{"repo_id": ..., "file_path": ...}``. Only providers that can resolve
+        the sibling through their own authenticated API (GitHub, GitLab) override this; both
+        require host allowlisting, check the resolved owner/group, and read from the
+        sibling's default branch. The default returns "" so unsupported providers degrade
+        gracefully without reaching an unrelated repository or host.
+        """
+        return ""
+
+    def is_sibling_repo_allowed(self, repo_id: str, *, case_sensitive: bool = True) -> bool:
+        """Require explicit host approval before resolving a sibling repository."""
+        allowed = get_settings().config.get("repo_context_sibling_repos", [])
+        if not isinstance(allowed, list):
+            return False
+        normalize = (lambda value: value) if case_sensitive else str.casefold
+        return normalize(repo_id) in {
+            normalize(value.strip().strip("/")) for value in allowed if isinstance(value, str) and value.strip()
+        }
+
+    def set_command_actor(self, actor) -> None:
+        """Record the authenticated user who triggered the current command.
+
+        Comment commands can pass arbitrary arguments, so sibling-repo context must be
+        authorized against the actor who issued the command rather than the PR/MR author:
+        a commenter may not have the read access the author has. Providers that resolve
+        siblings through their own authenticated API use this identity (when set) instead
+        of the PR/MR author. When no trustworthy actor is available the providers fail
+        closed for non-public siblings.
+        """
+        self._command_actor = actor
+
+    def get_repo_context_ref(self, from_default_branch: bool = False) -> Optional[str]:
+        """Return the ref (commit SHA or branch name) that repo-context files are read from.
+
+        The repo-context cache key (pr_agent/algo/repo_context.py) includes this ref so a
+        rebase or a push to the base branch invalidates cached file content instead of serving
+        it from a commit that has since moved. Providers that override get_repo_file_content
+        should return the same ref they fetch from; the default None covers providers with no
+        repo-context support at all.
+        """
+        return None
 
     def get_pr_id(self):
         return ""
+
+    @staticmethod
+    def _normalize_line_range(relevant_line_start: int, relevant_line_end: int = None) -> tuple[int, int | None]:
+        """Clamp inverted ranges and discard malformed end lines before building an anchor."""
+        if relevant_line_end is not None and relevant_line_start is not None:
+            try:
+                if int(relevant_line_end) < int(relevant_line_start):
+                    relevant_line_end = relevant_line_start
+            except (TypeError, ValueError):
+                relevant_line_end = None
+        return relevant_line_start, relevant_line_end
 
     def get_line_link(self, relevant_file: str, relevant_line_start: int, relevant_line_end: int = None) -> str:
         return ""
@@ -291,43 +893,177 @@ class GitProvider(ABC):
     def publish_comment(self, pr_comment: str, is_temporary: bool = False):
         pass
 
+    def should_publish_review_as_thread(self) -> bool:
+        return False
+
+    def should_publish_improve_as_thread(self) -> bool:
+        return False
+
+    def supports_html_comment_markers(self) -> bool:
+        """Return whether HTML comment identity markers render invisibly."""
+        return True
+
+    def should_reply_to_trigger_comment(self) -> bool:
+        return False
+
+    def supports_review_comment_identity(self) -> bool:
+        return False
+
+    def supports_review_finding_state(self) -> bool:
+        """Return whether this provider can verify PR-Agent-authored review comments."""
+        return False
+
+    def is_comment_authored_by_pr_agent(self, comment) -> bool:
+        """Return whether a provider comment was authored by this PR-Agent identity."""
+        return False
+
+    def unresolve_comment_thread(self, comment):  # noqa: B027 - intentional no-op
+        pass
+
+    def resolve_comment_thread(self, comment_id) -> bool:  # noqa: B027 - intentional no-op
+        return False
+
+    def supports_thread_resolution(self) -> bool:
+        """Providers that implement resolve_comment_thread override this."""
+        return False
+
+    def resolve_outdated_inline_threads(self):  # noqa: B027 - intentional no-op
+        pass
+
+    def supports_comment_editing(self) -> bool:
+        """Whether this provider can actually edit an existing comment.
+
+        The base ``edit_comment`` is a no-op that returns ``None``, which
+        ``publish_persistent_comment_full`` cannot distinguish from a successful
+        edit. A provider that has not implemented it therefore cannot persist,
+        and must create a new comment instead of silently discarding the body.
+        """
+        return type(self).edit_comment is not GitProvider.edit_comment
+
     def publish_persistent_comment(self, pr_comment: str,
                                    initial_header: str,
                                    update_header: bool = True,
                                    name='review',
-                                   final_update_message=True):
-        return self.publish_comment(pr_comment)
+                                   final_update_message=True,
+                                   as_thread: bool = False,
+                                   identity_marker: str | None = None,
+                                   legacy_initial_header: str | None = None):
+        if not self.supports_comment_editing():
+            return self.publish_comment(pr_comment, **({'as_thread': True} if as_thread else {}))
+        return self.publish_persistent_comment_full(
+            pr_comment,
+            initial_header,
+            update_header,
+            name,
+            final_update_message,
+            as_thread=as_thread,
+            identity_marker=identity_marker,
+            legacy_initial_header=legacy_initial_header,
+        )
+
+    @staticmethod
+    def _get_comment_body(comment) -> str:
+        """Return a comment body for object- and mapping-shaped provider payloads."""
+        if isinstance(comment, dict):
+            return comment.get("body", "")
+        return getattr(comment, "body", "")
+
+    def get_issue_comments_newest_first(self):
+        """Return issue comments newest first; providers override known API ordering."""
+        return list(reversed(list(self.get_issue_comments())))
+
+    def _iter_persistent_comments(
+        self,
+        identifiers,
+        *,
+        identity_marker: str | None = None,
+        require_agent_authorship: bool = False,
+    ):
+        """Yield matching comments in identity-priority and newest-first order."""
+        comments = self.get_issue_comments_newest_first()
+        for identifier in identifiers:
+            if not identifier:
+                continue
+            for comment in comments:
+                body = GitProvider._get_comment_body(comment)
+                if not comment_matches_identity(body, identifier):
+                    continue
+                if comment_carries_other_identity(body, identity_marker):
+                    continue
+                if require_agent_authorship and not self.is_comment_authored_by_pr_agent(comment):
+                    continue
+                yield comment, body
 
     def publish_persistent_comment_full(self, pr_comment: str,
                                    initial_header: str,
                                    update_header: bool = True,
                                    name='review',
-                                   final_update_message=True):
+                                   final_update_message=True,
+                                   as_thread: bool = False,
+                                   identity_marker: str | None = None,
+                                   legacy_initial_header: str | None = None,
+                                   require_agent_authorship: bool = False,
+                                   fallback_on_error: bool = True):
         try:
-            prev_comments = list(self.get_issue_comments())
-            for comment in prev_comments:
-                if comment.body.startswith(initial_header):
-                    latest_commit_url = self.get_latest_commit_url()
-                    comment_url = self.get_comment_url(comment)
-                    if update_header:
-                        updated_header = f"{initial_header}\n\n#### ({name.capitalize()} updated until commit {latest_commit_url})\n"
-                        pr_comment_updated = pr_comment.replace(initial_header, updated_header)
-                    else:
-                        pr_comment_updated = pr_comment
-                    get_logger().info(f"Persistent mode - updating comment {comment_url} to latest {name} message")
-                    # response = self.mr.notes.update(comment.id, {'body': pr_comment_updated})
-                    self.edit_comment(comment, pr_comment_updated)
-                    if final_update_message:
-                        return self.publish_comment(
+            pr_comment = add_pr_review_identity(pr_comment, identity_marker, self)
+            identifiers = (
+                [identity_marker, legacy_initial_header]
+                if identity_marker
+                else [initial_header]
+            )
+            comment_to_update = None
+            for comment, _body in GitProvider._iter_persistent_comments(
+                self,
+                identifiers,
+                identity_marker=identity_marker,
+                require_agent_authorship=require_agent_authorship,
+            ):
+                comment_to_update = comment
+                break
+            if comment_to_update is not None:
+                comment = comment_to_update
+                latest_commit_url = self.get_latest_commit_url()
+                comment_url = self.get_comment_url(comment)
+                if update_header:
+                    update_message = f"#### ({name.capitalize()} updated until commit {latest_commit_url})\n"
+                    update_anchor = render_hidden_marker(identity_marker, self) if identity_marker else initial_header
+                    updated_anchor = f"{update_anchor}\n\n{update_message}"
+                    pr_comment_updated = pr_comment.replace(update_anchor, updated_anchor, 1)
+                else:
+                    pr_comment_updated = pr_comment
+                get_logger().info(f"Persistent mode - updating comment {comment_url} to latest {name} message")
+                if self.edit_comment(comment, pr_comment_updated) is False:
+                    raise RuntimeError("Failed to update persistent comment")
+                if as_thread:
+                    try:
+                        self.unresolve_comment_thread(comment)
+                    except Exception as e:
+                        get_logger().warning(f"Failed to reopen review thread: {e}")
+                if final_update_message:
+                    try:
+                        status_comment = self.publish_comment(
                             f"**[Persistent {name}]({comment_url})** updated to latest commit {latest_commit_url}")
-                    return comment
+                        if status_comment is None or status_comment is False:
+                            get_logger().warning(
+                                "Persistent review update message was not published; "
+                                "review was already updated"
+                            )
+                            return comment
+                        return status_comment
+                    except Exception:
+                        get_logger().opt(exception=True).warning(
+                            "Failed to publish persistent review update message; review was already updated")
+                        return comment
+                return comment
         except Exception as e:
             get_logger().exception(f"Failed to update persistent review, error: {e}")
-            pass
-        return self.publish_comment(pr_comment)
+            if not fallback_on_error:
+                return None
+        return self.publish_comment(pr_comment, **({'as_thread': True} if as_thread else {}))
 
     @abstractmethod
-    def publish_inline_comment(self, body: str, relevant_file: str, relevant_line_in_file: str, original_suggestion=None):
+    def publish_inline_comment(self, body: str, relevant_file: str, relevant_line_in_file: str,
+                               original_suggestion=None):
         pass
 
     def create_inline_comment(self, body: str, relevant_file: str, relevant_line_in_file: str,
@@ -347,7 +1083,8 @@ class GitProvider(ABC):
         pass
 
     @abstractmethod
-    def get_issue_comments(self):
+    def get_issue_comments(self) -> Iterable:
+        """Comments on the PR; every item exposes the comment text as `.body`."""
         pass
 
     def get_comment_url(self, comment) -> str:
@@ -365,12 +1102,55 @@ class GitProvider(ABC):
     def get_pr_labels(self, update=False):
         pass
 
-    def get_repo_labels(self):
-        pass
+    def add_reaction(self, issue_comment_id: int, reaction: str) -> Optional[int]:
+        """Add a named reaction to a comment, returning its id.
 
-    @abstractmethod
+        Returns None when the provider has no reaction API, when the name is empty, or when
+        the call failed. Providers that support reactions override this; `add_eyes_reaction`
+        and `react_to_outcome` are built on top of it.
+        """
+        return None
+
     def add_eyes_reaction(self, issue_comment_id: int, disable_eyes: bool = False) -> Optional[int]:
-        pass
+        """Acknowledge a comment command with the configured start reaction."""
+        if disable_eyes:
+            return None
+        reaction = get_reaction_setting("reaction_on_start", DEFAULT_START_REACTION)
+        if not reaction:
+            return None
+        reaction_id = self.add_reaction(issue_comment_id, reaction)
+        if reaction_id is not None:
+            # Remembered so that `react_to_outcome` can take it down again. Nothing else removes
+            # it, so without this the start reaction would sit next to the outcome one forever.
+            self._start_reaction = (issue_comment_id, reaction_id)
+        return reaction_id
+
+    def react_to_outcome(self, issue_comment_id: int, succeeded: bool) -> Optional[int]:
+        """Replace the start reaction with the configured outcome reaction.
+
+        Both outcome reactions are unset by default, so nothing changes unless an operator asks
+        for it. When one is configured the start reaction is removed first, so the comment ends
+        up carrying the outcome rather than both.
+        """
+        reaction = get_reaction_setting(
+            "reaction_on_success" if succeeded else "reaction_on_failure"
+        )
+        if not reaction or issue_comment_id is None:
+            return None
+        self._remove_start_reaction(issue_comment_id)
+        return self.add_reaction(issue_comment_id, reaction)
+
+    def _remove_start_reaction(self, issue_comment_id: int) -> None:
+        """Take down the start reaction this provider added to `issue_comment_id`, if any."""
+        pending = getattr(self, "_start_reaction", None)
+        if not pending or pending[0] != issue_comment_id:
+            return
+        self._start_reaction = None
+        try:
+            self.remove_reaction(issue_comment_id, pending[1])
+        except Exception as e:
+            # Losing the start reaction is cosmetic; never let it fail the command that succeeded.
+            get_logger().warning("Failed to remove the start reaction", artifact={"error": e})
 
     @abstractmethod
     def remove_reaction(self, issue_comment_id: int, reaction_id: int) -> bool:
@@ -378,7 +1158,7 @@ class GitProvider(ABC):
 
     #### commits operations ####
     @abstractmethod
-    def get_commit_messages(self):
+    def get_commit_messages(self) -> str:
         pass
 
     def get_pr_url(self) -> str:
@@ -387,6 +1167,19 @@ class GitProvider(ABC):
         return ""
 
     def get_latest_commit_url(self) -> str:
+        return ""
+
+    def get_pr_head_sha(self) -> str:
+        """Return the commit SHA the pull request currently points at.
+
+        The reviewer records this in the persistent finding marker so a later run can
+        tell whether the head moved. It stays empty when a provider cannot resolve a
+        head, which makes the reconciliation guard refuse to resolve findings rather
+        than resolve them against the wrong revision.
+
+        Returns:
+            str: the head commit SHA, or an empty string when unavailable.
+        """
         return ""
 
     def auto_approve(self) -> bool:
@@ -398,11 +1191,18 @@ class GitProvider(ABC):
     def get_num_of_files(self):
         try:
             return len(self.get_diff_files())
-        except Exception as e:
+        except Exception:
             return -1
 
     def limit_output_characters(self, output: str, max_chars: int):
-        return output[:max_chars] + '...' if len(output) > max_chars else output
+        """Truncate output to max_chars, including the truncation suffix."""
+        if len(output) <= max_chars:
+            return output
+        if max_chars <= 0:
+            return ""
+        suffix = "..."
+        suffix = suffix[:max_chars]
+        return output[:max_chars - len(suffix)] + suffix
 
 
 def get_main_pr_language(languages, files) -> str:
@@ -418,30 +1218,47 @@ def get_main_pr_language(languages, files) -> str:
         return main_language_str
 
     try:
+        languages = numeric_languages(languages)
+        if not languages:
+            return main_language_str
         top_language = max(languages, key=languages.get).lower()
 
-        # validate that the specific commit uses the main language
-        extension_list = []
-        for file in files:
-            if not file:
-                continue
-            if isinstance(file, str):
-                file = FilePatchInfo(base_file=None, head_file=None, patch=None, filename=file)
-            extension_list.append(file.filename.rsplit('.')[-1])
-
-        # get the most common extension
-        most_common_extension = '.' + max(set(extension_list), key=extension_list.count)
+        # Validate that the specific commit uses the main language. Resolve every
+        # filename through the shared classifier instead of its last suffix: a bare
+        # rsplit('.') turned "Config.cmake.in" into ".in", "module.bsl" into ".bsl"
+        # (the map stores the wildcard "*.bsl") and "handler.PY" into ".PY", so none of
+        # them matched and the function returned an empty language.
         try:
             language_extension_map_org = get_settings().language_extension_map_org
-            language_extension_map = {k.lower(): v for k, v in language_extension_map_org.items()}
+            get_language = build_language_file_matcher(language_extension_map_org)
 
-            if top_language in language_extension_map and most_common_extension in language_extension_map[top_language]:
+            language_list = []
+            for file in files:
+                if not file:
+                    continue
+                if isinstance(file, str):
+                    file = FilePatchInfo(base_file=None, head_file=None, patch=None, filename=file)
+                language = get_language(file.filename)
+                if language:
+                    language_list.append(language.lower())
+
+            if not language_list:
+                return main_language_str
+
+            # Count languages rather than suffixes so a stray README does not outvote
+            # the code. dict.fromkeys keeps file order, so a tie resolves the same way
+            # every run.
+            languages_in_diff = dict.fromkeys(language_list)
+            most_common_language = max(
+                languages_in_diff, key=lambda language: language_list.count(language)
+            )
+
+            # Keep the provider's spelling when it agrees with what the diff contains,
+            # and otherwise trust the diff.
+            if most_common_language == top_language:
                 main_language_str = top_language
             else:
-                for language, extensions in language_extension_map.items():
-                    if most_common_extension in extensions:
-                        main_language_str = language
-                        break
+                main_language_str = most_common_language
         except Exception as e:
             get_logger().exception(f"Failed to get main language: {e}")
 
