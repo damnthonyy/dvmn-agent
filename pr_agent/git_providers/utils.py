@@ -1,21 +1,280 @@
 import copy
+import itertools
+import math
 import os
+import posixpath
+import re
 import tempfile
+import tomllib
 import traceback
+from urllib.parse import urlparse
+from urllib.request import Request, url2pathname, urlopen
 
 from dynaconf import Dynaconf
+from dynaconf.loaders import env_loader
 from starlette_context import context
 
 from pr_agent.config_loader import get_settings
+from pr_agent.config_security import (
+    PER_DIRECTORY_HOST_ONLY_KEYS_BY_SECTION,
+    REPO_HOST_ONLY_KEYS_BY_SECTION,
+    REPO_OVERRIDABLE_KEYS_BY_HOST_SECTION,
+    REPO_PER_DIRECTORY_OVERRIDABLE_SECTIONS,
+)
+from pr_agent.custom_merge_loader import MAX_TOML_SIZE_IN_BYTES, validate_file_security
 from pr_agent.git_providers import get_git_provider_with_context
+from pr_agent.git_providers.git_provider import get_config_branch
 from pr_agent.log import get_logger
+
+_MAX_EXTRA_CONFIG_BYTES = 1 * 1024 * 1024  # 1 MB cap for a remote .toml
+_FETCH_TIMEOUT_SECONDS = 10
+# Hard ceiling on the number of per-directory `.pr_agent.toml` files applied per MR,
+# so a wide, multi-service diff cannot trigger a burst of config fetches.
+_DEFAULT_MAX_PER_DIRECTORY_SETTINGS = 20
+# Aggregate byte budget for per-directory settings retained per MR. The per-file cap is
+# MAX_TOML_SIZE_IN_BYTES (the same limit the loader applies); this trusted total keeps a
+# batch of contributor-controlled files from being retained and parsed in bulk.
+_PER_DIRECTORY_SETTINGS_AGGREGATE_BYTES = 5 * 1024 * 1024
+# Bare Windows drive-letter paths (e.g. "C:\\shared.toml", "D:/cfg.toml").
+# urlparse() would otherwise interpret the drive letter as a URL scheme.
+_WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _safe_url_for_log(url: str) -> str:
+    """
+    Render a URL safe for logging: strip userinfo (user:pass@) and the query
+    string, both of which may carry credentials (e.g. ?private_token=...).
+    Falls back to a redacted placeholder on any parse error.
+    """
+    try:
+        parsed = urlparse(url)
+        netloc = parsed.hostname or ''
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
+        return f"{parsed.scheme}://{netloc}{parsed.path}"
+    except Exception:
+        return "<extra config URL redacted>"
+
+
+def _resolve_extra_config_to_file(source):
+    """
+    Resolve --extra_config_url to a local readable .toml file.
+
+    Accepts:
+      - http:// or https:// URL: fetched via urllib (with optional auth header
+        from PR_AGENT_EXTRA_CONFIG_AUTH_HEADER, e.g. "PRIVATE-TOKEN: <token>").
+      - file:// URL: treated as a local path.
+      - bare local path: used directly.
+
+    Returns (path, is_temp). Caller must remove path if is_temp is True.
+    Returns (None, False) if source can't be resolved.
+
+    Logs never include the raw URL — `_safe_url_for_log()` strips userinfo and
+    query string so embedded credentials don't leak into CI logs.
+    """
+    # Validate / normalise the input at the boundary
+    if not isinstance(source, str):
+        get_logger().warning(
+            f"Ignoring CONFIG.EXTRA_CONFIG_URL: expected str, got {type(source).__name__}"
+        )
+        return None, False
+    source = source.strip()
+    if not source:
+        return None, False
+
+    # Bare Windows drive-letter paths must be handled before urlparse() — it
+    # would otherwise treat the drive letter as a URL scheme.
+    if _WINDOWS_DRIVE_PATH_RE.match(source):
+        if os.path.isfile(source):
+            return source, False
+        get_logger().warning(f"Extra config not found at local path: {source}")
+        return None, False
+
+    parsed = urlparse(source)
+    scheme = (parsed.scheme or "").lower()
+
+    # Local path (bare or file://)
+    if scheme in ("", "file"):
+        if scheme == "file":
+            # Preserve any non-localhost netloc (UNC-style file://host/share/...)
+            # and URL-decode percent-encoded path components via url2pathname.
+            netloc = parsed.netloc or ""
+            raw = parsed.path
+            if netloc and netloc.lower() != "localhost":
+                raw = f"//{netloc}{raw}"
+            local_path = url2pathname(raw)
+        else:
+            local_path = source
+        if os.path.isfile(local_path):
+            return local_path, False
+        get_logger().warning(f"Extra config not found at local path: {local_path}")
+        return None, False
+
+    if scheme not in ("http", "https"):
+        get_logger().warning(f"Unsupported scheme for extra config: {scheme}")
+        return None, False
+
+    # Fetch over HTTP(S)
+    safe_url = _safe_url_for_log(source)
+    headers = {"Accept": "text/plain, application/toml, */*"}
+    auth_header = os.environ.get("PR_AGENT_EXTRA_CONFIG_AUTH_HEADER")
+    if auth_header:
+        if ":" in auth_header:
+            name, value = auth_header.split(":", 1)
+            headers[name.strip()] = value.strip()
+        else:
+            # Surface misconfiguration instead of silently dropping the header.
+            get_logger().warning(
+                "PR_AGENT_EXTRA_CONFIG_AUTH_HEADER is set but malformed "
+                "(expected '<HeaderName>: <value>'); ignoring."
+            )
+
+    try:
+        req = Request(source, headers=headers, method="GET")
+        with urlopen(req, timeout=_FETCH_TIMEOUT_SECONDS) as resp:
+            data = resp.read(_MAX_EXTRA_CONFIG_BYTES + 1)
+        if len(data) > _MAX_EXTRA_CONFIG_BYTES:
+            get_logger().warning(
+                f"Extra config exceeds {_MAX_EXTRA_CONFIG_BYTES} bytes, skipping: {safe_url}"
+            )
+            return None, False
+        fd, tmp_path = tempfile.mkstemp(suffix=".toml")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        get_logger().info(f"Fetched extra config from {safe_url} ({len(data)} bytes)")
+        return tmp_path, True
+    except Exception as e:
+        get_logger().warning(f"Failed to fetch extra config from {safe_url}: {e}")
+        return None, False
+
+
+def _reapply_env_overrides():
+    """
+    Re-run dynaconf's env_loader against the global settings so env-sourced
+    values win over any keys just merged from a config file.
+
+    Why: _apply_settings_from_file() and the repo-local merge below both
+    overwrite section dicts wholesale. Without this re-application, an extra
+    config file or repo .pr_agent.toml can silently replace a secret supplied
+    via environment variable — breaking the documented precedence (env vars
+    are the highest layer; see docs/usage-guide/configuration_options.md).
+    """
+    try:
+        env_loader.load(get_settings())
+    except Exception as e:
+        # Never let a precedence-restoration error block apply_repo_settings;
+        # log and continue with whatever state the merge left.
+        get_logger().warning(f"Failed to re-apply env-var overrides: {e}")
+
+
+def _apply_settings_from_file(path: str, label: str):
+    """
+    Merge an external .toml settings file into the global settings, section-by-section.
+    Uses the same custom_merge_loader as repo-local settings so security checks
+    (forbidden includes/preloads/loaders) apply consistently.
+    """
+    if not path or not os.path.isfile(path):
+        return
+    try:
+        dynconf_kwargs = {
+            "core_loaders": [],
+            "loaders": ["pr_agent.custom_merge_loader"],
+            "merge_enabled": True,
+        }
+        try:
+            new_settings = Dynaconf(
+                settings_files=[path],
+                load_dotenv=False,
+                envvar_prefix=False,
+                **dynconf_kwargs,
+            )
+        except TypeError as e:
+            # Older Dynaconf versions don't accept load_dotenv / merge_enabled.
+            # The fallback Dynaconf(...) call below skips our custom_merge_loader,
+            # which is where validate_file_security() runs. Pre-validate the file
+            # explicitly here so forbidden directives (includes, preloads, custom
+            # loaders, ...) still cannot slip through on those older versions.
+            try:
+                with open(path, "rb") as f:
+                    parsed_toml = tomllib.load(f)
+                validate_file_security(parsed_toml, path)
+            except Exception as sec_err:
+                get_logger().warning(
+                    f"Extra config failed security pre-validation; skipping: {sec_err}"
+                )
+                return
+
+            get_logger().warning(
+                "Your Dynaconf version does not support disabled "
+                "'load_dotenv'/'merge_enabled' parameters. Loading extra config "
+                "after explicit security pre-validation; some Dynaconf-level "
+                "hardening flags are off. Please upgrade Dynaconf for better "
+                "security.",
+                artifact={"error": e, "traceback": traceback.format_exc()},
+            )
+            new_settings = Dynaconf(settings_files=[path])
+
+        merged_sections = []
+        for section, contents in new_settings.as_dict().items():
+            if not contents:
+                continue
+            section_dict = copy.deepcopy(get_settings().as_dict().get(section, {}))
+            for key, value in contents.items():
+                section_dict[key] = value
+            get_settings().unset(section)
+            get_settings().set(section, section_dict, merge=False)
+            merged_sections.append(section)
+        # Restore env-var precedence: the section-level unset()/set() above can
+        # silently overwrite values originally sourced from env vars. Replay
+        # env_loader so the env layer remains the top of the precedence stack.
+        _reapply_env_overrides()
+        # Do NOT log the merged dict: external/repo .pr_agent.toml may contain
+        # secrets (e.g. openai.key, gitlab.personal_access_token) that would
+        # otherwise leak into CI logs. Section names are safe and sufficient
+        # for debugging which file contributed what.
+        get_logger().info(
+            f"Applied {label} settings from {path} (sections merged: {sorted(merged_sections)})"
+        )
+    except Exception as e:
+        get_logger().warning(f"Failed to apply {label} settings from {path}: {e}")
 
 
 def apply_repo_settings(pr_url):
     os.environ["AUTO_CAST_FOR_DYNACONF"] = "false"
+    _restore_per_directory_settings()
+
+    # Apply external/shared config FIRST, before constructing the git provider:
+    # provider initialisers (e.g. GitLabProvider reads GITLAB.PERSONAL_ACCESS_TOKEN
+    # at __init__) need to see any provider-critical settings that come from the
+    # extra file. Repo-local .pr_agent.toml is still applied later and overrides
+    # the extra file on conflicting keys.
+    extra_source = get_settings().get("CONFIG.EXTRA_CONFIG_URL", None)
+    if isinstance(extra_source, str) and extra_source.strip():
+        extra_path, extra_is_temp = _resolve_extra_config_to_file(extra_source)
+        if extra_path:
+            try:
+                # _apply_settings_from_file() re-applies env-var overrides
+                # itself, so env precedence is restored before the provider
+                # is constructed below.
+                _apply_settings_from_file(extra_path, label="extra")
+            finally:
+                if extra_is_temp:
+                    try:
+                        os.remove(extra_path)
+                    except Exception as e:
+                        get_logger().error(
+                            f"Failed to remove temp extra config {extra_path}: {e}"
+                        )
+    elif extra_source is not None and not isinstance(extra_source, str):
+        get_logger().warning(
+            "Ignoring CONFIG.EXTRA_CONFIG_URL: expected str, got "
+            f"{type(extra_source).__name__}"
+        )
+
     git_provider = get_git_provider_with_context(pr_url)
+
     if get_settings().config.use_repo_settings_file:
-        repo_settings_file = None
+        repo_settings_files = []
         try:
             try:
                 repo_settings = context.get("repo_settings", None)
@@ -29,65 +288,487 @@ def apply_repo_settings(pr_url):
                 except Exception:
                     pass
 
-            error_local = None
+            config_errors = []
             if repo_settings:
-                repo_settings_file = None
-                category = 'local'
-                try:
-                    fd, repo_settings_file = tempfile.mkstemp(suffix='.toml')
-                    os.write(fd, repo_settings)
-
+                # Apply each settings source (e.g. global then local) independently and in order.
+                # Loading them in a single Dynaconf call would fail all sources on one bad file and
+                # misattribute the error to the last source; applying per-scope keeps error reporting
+                # (and redaction) accurate and lets valid sources still take effect.
+                for category, settings_content in _normalize_repo_settings(repo_settings):
+                    repo_settings_file = _write_settings_temp(settings_content, repo_settings_files)
                     try:
-                        dynconf_kwargs = {'core_loaders': [],  # DISABLE default loaders, otherwise will load toml files more than once.
-                             'loaders': ['pr_agent.custom_merge_loader'],
-                             # Use a custom loader to merge sections, but overwrite their overlapping values. Don't involve ENV variables.
-                             'merge_enabled': True  # Merge multiple files; ensures [XYZ] sections only overwrite overlapping keys, not whole sections.
-                         }
+                        _apply_repo_settings_file(repo_settings_file)
+                    except Exception as e:
+                        get_logger().warning(f"Failed to apply repo {category} settings, error: {str(e)}")
+                        config_errors.append({'error': str(e), 'settings': settings_content, 'category': category})
 
-                        new_settings = Dynaconf(settings_files=[repo_settings_file],
-                                                # Disable all dynamic loading features
-                                                load_dotenv=False,  # Don't load .env files
-                                                envvar_prefix=False,  # Drop DYNACONF for env. variables
-                                                **dynconf_kwargs
-                                                )
-                    except TypeError as e:
-                        # Fallback for older Dynaconf versions that don't support these parameters
-                        get_logger().warning(
-                            "Your Dynaconf version does not support disabled 'load_dotenv'/'merge_enabled' parameters. "
-                            "Loading repo settings without these security features. "
-                            "Please upgrade Dynaconf for better security.",
-                            artifact={"error": e, "traceback": traceback.format_exc()})
-                        new_settings = Dynaconf(settings_files=[repo_settings_file])
-
-                    for section, contents in new_settings.as_dict().items():
-                        if not contents:
-                            # Skip excluded items, such as forbidden to load env.
-                            get_logger().debug(f"Skipping a section: {section} which is not allowed")
-                            continue
-                        section_dict = copy.deepcopy(get_settings().as_dict().get(section, {}))
-                        for key, value in contents.items():
-                            section_dict[key] = value
-                        get_settings().unset(section)
-                        get_settings().set(section, section_dict, merge=False)
-                    get_logger().info(f"Applying repo settings:\n{new_settings.as_dict()}")
+            # Per-directory layer (monorepo support, opt-in): merge `.pr_agent.toml` files found in
+            # the directories the PR touches. Applied after the root config so a nearer file
+            # overrides a farther one; only non-critical sections are accepted (see
+            # REPO_PER_DIRECTORY_OVERRIDABLE_SECTIONS).
+            for category, settings_content in _get_per_directory_settings(git_provider):
+                repo_settings_file = _write_settings_temp(settings_content, repo_settings_files)
+                try:
+                    _apply_repo_settings_file(repo_settings_file, repo_settings_scope="per_directory")
                 except Exception as e:
-                    get_logger().warning(f"Failed to apply repo {category} settings, error: {str(e)}")
-                    error_local = {'error': str(e), 'settings': repo_settings, 'category': category}
+                    get_logger().warning(f"Failed to apply per-directory settings {category}, error: {str(e)}")
+                    config_errors.append({'error': str(e), 'settings': settings_content, 'category': category})
 
-                if error_local:
-                    handle_configurations_errors([error_local], git_provider)
+            if config_errors:
+                handle_configurations_errors(config_errors, git_provider)
         except Exception as e:
             get_logger().exception("Failed to apply repo settings", e)
         finally:
-            if repo_settings_file:
+            for repo_settings_file in repo_settings_files:
                 try:
                     os.remove(repo_settings_file)
                 except Exception as e:
-                    get_logger().error(f"Failed to remove temporary settings file {repo_settings_file}", e)
+                    get_logger().error(f"Failed to remove temporary settings file {repo_settings_file}: {e}")
 
-    # enable switching models with a short definition
-    if get_settings().config.model.lower() == 'claude-3-5-sonnet':
-        set_claude_model()
+
+def _restore_per_directory_settings():
+    """Remove the previous directory overlay before applying this command's trusted settings."""
+    settings = get_settings()
+    previous = vars(settings).pop("_per_directory_original_values", {})
+    for section, original_values in previous.items():
+        contents = copy.deepcopy(settings.as_dict().get(section, {}))
+        for key, (present, value) in original_values.items():
+            for current_key in list(contents):
+                if current_key.lower() == key:
+                    del contents[current_key]
+            if present:
+                contents[key] = value
+        settings.unset(section)
+        if contents:
+            settings.set(section, contents, merge=False)
+
+
+def _write_settings_temp(settings_content, repo_settings_files: list) -> str:
+    """Write a settings payload (str or bytes) to a temp .toml file registered for cleanup.
+
+    os.fdopen takes ownership of the fd (closes it) and write() writes all bytes,
+    avoiding a silently-truncated file from a partial os.write.
+    """
+    fd, repo_settings_file = tempfile.mkstemp(suffix='.toml')
+    repo_settings_files.append(repo_settings_file)
+    if isinstance(settings_content, str):
+        settings_content = settings_content.encode("utf-8")
+    with os.fdopen(fd, "wb") as settings_file_handle:
+        settings_file_handle.write(settings_content)
+    return repo_settings_file
+
+
+def _apply_repo_settings_file(repo_settings_file, repo_settings_scope="repo"):
+    """Load a single repo settings file and merge its allowed keys into the global settings.
+
+    Enforces the per-repo host-key restrictions and logs only section names (values may contain
+    secrets). With ``repo_settings_scope="per_directory"`` the per-directory section allowlist
+    (REPO_PER_DIRECTORY_OVERRIDABLE_SECTIONS) is enforced on top, so a nested config committed by
+    any contributor cannot touch secrets/identity or deployment-critical settings that the root
+    config may set. Raises on load/parse failure so the caller can attribute the error to the
+    correct settings scope (e.g. 'global' vs 'local').
+    """
+    # Enforce the same size cap as the loader BEFORE parsing, so an oversized file can't be fully
+    # read/parsed in-process (OOM/CPU) by the explicit validation below.
+    if os.path.getsize(repo_settings_file) > MAX_TOML_SIZE_IN_BYTES:
+        get_logger().warning(
+            f"Settings file too large (> {MAX_TOML_SIZE_IN_BYTES} bytes); skipping repo settings file")
+        return
+
+    # Validate the file explicitly first: the shared custom_merge_loader runs with silent=True and
+    # would otherwise swallow TOML/security errors, skipping the file without surfacing a scoped
+    # configuration error. Parsing here makes malformed/forbidden config raise so it gets reported.
+    with open(repo_settings_file, "rb") as f:
+        parsed_toml = tomllib.load(f)
+    # Use a generic name (not the temp path) so a SecurityError message can't leak the server's
+    # internal filesystem path into the PR configuration-error comment.
+    validate_file_security(parsed_toml, ".pr_agent.toml")
+
+    # Apply the already-parsed data directly instead of re-reading the file through Dynaconf, which
+    # would parse the same TOML a second time. Section names are matched case-insensitively (Dynaconf
+    # stores them upper-cased); list/dict values replace rather than merge, matching the loader.
+    for section, contents in parsed_toml.items():
+        if not isinstance(contents, dict) or not contents:
+            get_logger().debug(f"Skipping non-table or empty section: {section}")
+            continue
+        if repo_settings_scope == "per_directory":
+            if section.lower() not in REPO_PER_DIRECTORY_OVERRIDABLE_SECTIONS:
+                get_logger().warning(
+                    f"Ignoring section [{section}] from per-directory settings: only "
+                    f"{sorted(REPO_PER_DIRECTORY_OVERRIDABLE_SECTIONS)} may be set per directory"
+                )
+                continue
+            per_dir_allowed_keys = REPO_PER_DIRECTORY_OVERRIDABLE_SECTIONS[section.lower()]
+            if isinstance(per_dir_allowed_keys, frozenset):
+                rejected = [k for k in contents if k.lower() not in per_dir_allowed_keys]
+                if rejected:
+                    get_logger().warning(
+                        f"Ignoring non-overridable key(s) {rejected} in section [{section}] from "
+                        f"per-directory settings; only {sorted(per_dir_allowed_keys)} may be set here"
+                    )
+                contents = {k: v for k, v in contents.items() if k.lower() in per_dir_allowed_keys}
+                if not contents:
+                    continue
+            if section.lower() == "pr_description":
+                normalized_contents = {key.lower(): value for key, value in contents.items()}
+                threshold = normalized_contents.get("collapsible_file_list_threshold")
+                if (
+                    "collapsible_file_list_threshold" in normalized_contents
+                    and (
+                        isinstance(threshold, bool)
+                        or not isinstance(threshold, int)
+                        or not 0 <= threshold <= 1000
+                    )
+                ):
+                    get_logger().warning(
+                        "Ignoring invalid collapsible_file_list_threshold from per-directory settings; expected an "
+                        "integer between 0 and 1000"
+                    )
+                    contents = {
+                        key: value for key, value in contents.items()
+                        if key.lower() != "collapsible_file_list_threshold"
+                    }
+                    if not contents:
+                        continue
+            per_dir_host_only_keys = PER_DIRECTORY_HOST_ONLY_KEYS_BY_SECTION.get(section.lower(), frozenset())
+            rejected = [k for k in contents if k.lower() in per_dir_host_only_keys]
+            if rejected:
+                get_logger().warning(
+                    f"Ignoring host-only key(s) {rejected} in section [{section}] from per-directory settings"
+                )
+            contents = {k: v for k, v in contents.items() if k.lower() not in per_dir_host_only_keys}
+            if not contents:
+                continue
+            if section.lower() == "config":
+                normalized_contents = {key.lower(): value for key, value in contents.items()}
+                invalid_config_keys = [
+                    key for key in ("model", "model_weak", "model_reasoning", "response_language")
+                    if key in normalized_contents
+                    and (not isinstance(normalized_contents[key], str) or not normalized_contents[key].strip())
+                ]
+                if invalid_config_keys:
+                    get_logger().warning(
+                        f"Ignoring non-string or empty setting(s) {invalid_config_keys} from per-directory settings"
+                    )
+                    contents = {
+                        key: value for key, value in contents.items() if key.lower() not in invalid_config_keys
+                    }
+                if not contents:
+                    continue
+                invalid_temperature = (
+                    "temperature" in normalized_contents
+                    and (
+                        isinstance(normalized_contents["temperature"], bool)
+                        or not isinstance(normalized_contents["temperature"], (int, float))
+                        or not math.isfinite(normalized_contents["temperature"])
+                        or not 0 <= normalized_contents["temperature"] <= 2
+                    )
+                )
+                if invalid_temperature:
+                    get_logger().warning(
+                        "Ignoring invalid temperature setting from per-directory settings; expected a finite number "
+                        "between 0 and 2"
+                    )
+                    contents = {key: value for key, value in contents.items() if key.lower() != "temperature"}
+                if not contents:
+                    continue
+        allowed_keys = REPO_OVERRIDABLE_KEYS_BY_HOST_SECTION.get(section.lower())
+        if allowed_keys is not None:
+            rejected = [k for k in contents if k.lower() not in allowed_keys]
+            if rejected:
+                get_logger().warning(
+                    f"Ignoring host-only key(s) {rejected} in section [{section}] from repo "
+                    f"settings; only {sorted(allowed_keys)} may be set per-repo for this section"
+                )
+            contents = {k: v for k, v in contents.items() if k.lower() in allowed_keys}
+            if not contents:
+                continue
+        else:
+            host_only_keys = REPO_HOST_ONLY_KEYS_BY_SECTION.get(section.lower(), frozenset())
+            rejected = [k for k in contents if k.lower() in host_only_keys]
+            if rejected:
+                get_logger().warning(
+                    f"Ignoring host-only key(s) {rejected} in section [{section}] from repo settings"
+                )
+                contents = {k: v for k, v in contents.items() if k.lower() not in host_only_keys}
+                if not contents:
+                    continue
+        section_dict = copy.deepcopy(get_settings().as_dict().get(section.upper(), {}))
+        if repo_settings_scope == "per_directory":
+            previous = vars(get_settings()).setdefault("_per_directory_original_values", {})
+            original_values = previous.setdefault(section.upper(), {})
+            normalized = {key.lower(): value for key, value in section_dict.items()}
+            for key in contents:
+                original_values.setdefault(
+                    key.lower(), (key.lower() in normalized, copy.deepcopy(normalized.get(key.lower()))))
+        for key, value in contents.items():
+            # Dynaconf looks up keys case-insensitively, so replacing the existing key
+            # (whatever its casing) keeps the newer value from a nearer/sibling config
+            # deterministic instead of leaving an "canonical-cased" duplicate beside it.
+            for existing_key in list(section_dict):
+                if existing_key.lower() == key.lower():
+                    del section_dict[existing_key]
+            section_dict[key] = value
+        get_settings().unset(section)
+        get_settings().set(section, section_dict, merge=False)
+    # Same precedence-restoration rationale as the extra-config path: env-sourced values
+    # must remain the highest layer.
+    _reapply_env_overrides()
+    # Do NOT log the merged dict: repo/global .pr_agent.toml may contain secrets
+    # (e.g. openai.key, gitlab.personal_access_token) that would otherwise leak into
+    # CI logs. Section names are safe and sufficient for debugging.
+    get_logger().info(
+        f"Applying repo settings (sections: {sorted(parsed_toml.keys())})"
+    )
+
+
+def _normalize_repo_settings(repo_settings):
+    if isinstance(repo_settings, (bytes, str)):
+        return [("local", repo_settings)]
+    return repo_settings
+
+
+def _get_changed_file_paths(git_provider) -> list[str]:
+    """Return the repository-relative paths the PR/MR touches.
+
+    Includes rename metadata (old_path / previous_filename) when the provider
+    surfaces it, so ancestor configs for both sides of a move apply. Prefers the
+    complete PR file set (get_pr_file_paths) over get_files(), which many
+    providers narrow to the unreviewed subset while an incremental review is
+    active; discovery must always see the whole PR so applied settings do not
+    change between commands. Tolerates each provider's entry shape (str, dict
+    keyed by new_path/filename/path, or an object with .filename/.new_path). A
+    failure to list files degrades to no per-directory configs rather than
+    failing the request.
+    """
+    try:
+        full_paths = getattr(git_provider, "get_pr_file_paths", None)
+        files = full_paths() if full_paths is not None else git_provider.get_files()
+    except Exception as e:
+        get_logger().warning(f"Failed to list changed files for per-directory settings: {e}")
+        return []
+    paths = []
+    for entry in files or []:
+        for name in _entry_path_names(entry):
+            if name not in paths:
+                paths.append(name)
+    return paths
+
+
+def _entry_path_names(entry) -> list[str]:
+    """Extract any repository-relative path names an entry carries (new and old)."""
+    if isinstance(entry, str):
+        return [entry.strip()] if entry.strip() else []
+    if isinstance(entry, dict):
+        keys = ("new_path", "filename", "path", "old_path", "previous_filename")
+    else:
+        keys = ("filename", "new_path", "old_path", "previous_filename")
+    names = []
+    for key in keys:
+        value = entry.get(key) if isinstance(entry, dict) else getattr(entry, key, None)
+        if isinstance(value, str) and value.strip() and value != "/dev/null":
+            names.append(value.strip())
+    return names
+
+
+def _get_per_directory_settings(git_provider) -> list:
+    """Resolve the `.pr_agent.toml` files for the directories an MR touches.
+
+    Walks up from each changed file toward the repository root and keeps every
+    ancestor config whose directory has one (the root `.pr_agent.toml` is already
+    applied through get_repo_settings()). Results are returned ordered
+    shallowest-directory-first so a nearer (more specific) file overrides a farther
+    one on shared keys; list/dict values replace rather than concatenate, matching
+    the loader.
+
+    With a diff spanning several sibling directories (e.g. ``services/auth`` and
+    ``services/billing``), all of their configs apply to the whole MR: an explicit
+    deterministic tie-break orders equal-depth directories by path, so the
+    lexicographically-last sibling wins on a shared key. That is only meaningful as
+    a fallback, so overlapping keys between same-depth configs applied to one MR are
+    reported with a warning naming the conflict and the winner.
+
+    Returns [] when the feature is disabled, the provider lacks per-directory support,
+    the tree has no nested configs, or nothing is crossed.
+    """
+    settings = get_settings()
+    if not settings.config.get("enable_per_directory_settings", False):
+        return []
+    config_branch = get_config_branch()
+    tree_method = getattr(git_provider, "get_repo_settings_tree", None)
+    if tree_method is None:
+        return []
+    try:
+        tree_paths, resolved_ref = tree_method(config_branch)
+    except Exception as e:
+        get_logger().warning(f"Failed to list per-directory settings candidates: {e}")
+        return []
+    # The root `.pr_agent.toml` (directory '') is already applied through
+    # get_repo_settings(); only nested directories add per-directory behavior.
+    config_dirs = {
+        posixpath.dirname(p)
+        for p in tree_paths
+        if posixpath.basename(p) == ".pr_agent.toml" and posixpath.dirname(p)
+    }
+    if not config_dirs:
+        return []
+    changed_paths = _get_changed_file_paths(git_provider)
+    if not changed_paths:
+        return []
+
+    try:
+        max_configs = int(settings.config.get(
+            "per_directory_settings_max_files", _DEFAULT_MAX_PER_DIRECTORY_SETTINGS))
+    except (TypeError, ValueError):
+        max_configs = _DEFAULT_MAX_PER_DIRECTORY_SETTINGS
+    max_configs = max(1, max_configs)
+    crossed = set()
+    for changed_path in changed_paths:
+        directory = posixpath.dirname(changed_path)
+        while directory:
+            if directory in config_dirs:
+                crossed.add(directory)
+            parent = posixpath.dirname(directory)
+            if parent == directory:
+                break
+            directory = parent
+
+    if len(crossed) > max_configs:
+        get_logger().warning(
+            f"{len(crossed)} per-directory .pr_agent.toml files apply to this PR; "
+            f"applying at most {max_configs}, preferring shallower files and keeping "
+            f"later-path winners within a partially included depth"
+        )
+    # Shallowest (closest to root) first: later files override earlier ones, so the
+    # nearest directory wins on scalar keys. Equal-depth siblings are ordered by
+    # path, so the lexicographically-last directory wins deterministically (any
+    # overlap is surfaced by _warn_on_sibling_key_conflicts). When the cap cuts
+    # through an equal-depth group, the lexicographically-later (winning) entries
+    # are retained and the earlier ones dropped, so the documented winner still
+    # participates in the merge.
+    ordered = sorted(crossed, key=lambda directory: (directory.count("/"), directory))
+    if len(ordered) > max_configs:
+        kept = []
+        budget = max_configs
+        for _, siblings in itertools.groupby(ordered, key=lambda directory: directory.count("/")):
+            siblings = list(siblings)
+            if budget >= len(siblings):
+                kept.extend(siblings)
+                budget -= len(siblings)
+                continue
+            kept.extend(siblings[len(siblings) - budget:])
+            break
+        ordered = kept
+    if not ordered:
+        return []
+
+    contents_method = getattr(git_provider, "get_repo_settings_contents", None)
+    if contents_method is None:
+        return []
+    config_paths = [f"{directory}/.pr_agent.toml" for directory in ordered]
+    contents = contents_method(config_paths, resolved_ref) or {}
+    # Reject oversized or over-budget payloads before any conflict inspection or
+    # retention: files are contributor-controlled and unvalidated at fetch time, so a
+    # batch of them must not be held and parsed wholesale in one worker.
+    contents = _size_bounded_per_directory_contents(config_paths, contents)
+    _warn_on_sibling_key_conflicts(ordered, contents)
+    resolved = []
+    for path in config_paths:
+        content = contents.get(path)
+        if content is None:
+            continue
+        resolved.append((path, content))
+    if resolved:
+        get_logger().info(
+            f"Applying {len(resolved)} per-directory settings file(s): "
+            f"{sorted(entry[0] for entry in resolved)}"
+        )
+    return resolved
+
+
+def _size_bounded_per_directory_contents(config_paths: list[str], contents: dict[str, bytes]) -> dict[str, bytes]:
+    """Drop per-directory payloads that exceed the size caps before any parsing or retention.
+
+    Per-directory files are contributor-controlled and unvalidated at fetch time. Payloads
+    larger than ``MAX_TOML_SIZE_IN_BYTES`` are skipped, and retention stops once the
+    aggregate byte budget is exhausted, so a batch of oversized nested files cannot be kept
+    and parsed wholesale. Files already downloaded by the provider are unavoidable, but they
+    are not retained, parsed, or logged beyond a bounded warning.
+    """
+    bounded: dict[str, bytes] = {}
+    total_bytes = 0
+    for path in config_paths:
+        content = contents.get(path)
+        if content is None:
+            continue
+        size = len(content)
+        if size > MAX_TOML_SIZE_IN_BYTES:
+            get_logger().warning(
+                f"Per-directory settings file '{path}' is {size} bytes "
+                f"(> {MAX_TOML_SIZE_IN_BYTES}); skipping it"
+            )
+            continue
+        if total_bytes + size > _PER_DIRECTORY_SETTINGS_AGGREGATE_BYTES:
+            get_logger().warning(
+                f"Per-directory settings aggregate exceeds "
+                f"{_PER_DIRECTORY_SETTINGS_AGGREGATE_BYTES} bytes; skipping further files"
+            )
+            break
+        bounded[path] = content
+        total_bytes += size
+    return bounded
+
+
+def _warn_on_sibling_key_conflicts(ordered: list[str], contents: dict[str, bytes]) -> list[tuple[str, str, str]]:
+    """Log (section, key) collisions between equal-depth sibling configs.
+
+    Equal-depth directories are applied in path order (see _get_per_directory_settings),
+    so the lexicographically-last sibling wins on a shared key. Surface any such overlap
+    instead of letting it stay an arbitrary-looking silent choice. Returns the detected
+    conflicts as ``(section, key, winning_directory)`` for tests; parsing failures are
+    ignored here, since the real file is validated when applied and then reported
+    through handle_configurations_errors().
+    """
+    conflicts: list[tuple[str, str, str]] = []
+    grouped = itertools.groupby(sorted(ordered, key=lambda d: d.count("/")),
+                                key=lambda d: d.count("/"))
+    for _, group in grouped:
+        group = list(group)
+        if len(group) < 2:
+            continue
+        parsed = {}
+        for directory in group:
+            content = contents.get(f"{directory}/.pr_agent.toml")
+            if not content:
+                continue
+            if len(content) > MAX_TOML_SIZE_IN_BYTES:
+                get_logger().warning(
+                    f"Per-directory settings file '{directory}/.pr_agent.toml' exceeds "
+                    f"{MAX_TOML_SIZE_IN_BYTES} bytes; skipping sibling-conflict inspection"
+                )
+                continue
+            try:
+                parsed[directory] = tomllib.loads(content.decode("utf-8"))
+            except Exception:
+                continue
+        key_owners: dict[tuple[str, str], list[str]] = {}
+        for directory, data in parsed.items():
+            for section, table in data.items():
+                if not isinstance(table, dict):
+                    continue
+                for key in table:
+                    key_owners.setdefault((section.lower(), key.lower()), []).append(directory)
+        for (section, key), owners in sorted(key_owners.items()):
+            if len(owners) < 2:
+                continue
+            winner_directory = owners[-1]
+            get_logger().warning(
+                f"Per-directory settings at the same depth set the same key "
+                f"'{section}.{key}': sibling configs {sorted(owners)} all set it "
+                f"and '{winner_directory}/.pr_agent.toml' wins (later path overrides)"
+            )
+            conflicts.append((section, key, winner_directory))
+    return conflicts
 
 
 def handle_configurations_errors(config_errors, git_provider):
@@ -97,34 +778,45 @@ def handle_configurations_errors(config_errors, git_provider):
 
         for err in config_errors:
             if err:
-                configuration_file_content = err['settings'].decode()
                 err_message = err['error']
                 config_type = err['category']
                 header = f"❌ **PR-Agent failed to apply '{config_type}' repo settings**"
-                body = f"{header}\n\nThe configuration file needs to be a valid [TOML](https://qodo-merge-docs.qodo.ai/usage-guide/configuration_options/), please fix it.\n\n"
+                body = (
+                    f"{header}\n\nThe configuration file needs to be a valid "
+                    "[TOML](https://docs.pr-agent.ai/usage-guide/configuration_options/), please fix it.\n\n"
+                )
                 body += f"___\n\n**Error message:**\n`{err_message}`\n\n"
-                if git_provider.is_supported("gfm_markdown"):
-                    body += f"\n\n<details><summary>Configuration content:</summary>\n\n```toml\n{configuration_file_content}\n```\n\n</details>"
+                if config_type == "global":
+                    # Global content is redacted, so we never render it — skip decoding it entirely.
+                    # Global settings live in a `pr-agent-settings` repo scoped per platform
+                    # (GitHub organization, GitLab group, or Bitbucket workspace).
+                    body += ("\n\nThe invalid configuration came from the global "
+                             "`pr-agent-settings` settings repository.")
                 else:
-                    body += f"\n\n**Configuration content:**\n\n```toml\n{configuration_file_content}\n```\n\n"
-                get_logger().warning(f"Sending a 'configuration error' comment to the PR", artifact={'body': body})
+                    settings_content = err['settings']
+                    configuration_file_content = (
+                        settings_content.decode("utf-8", errors="replace")
+                        if isinstance(settings_content, bytes) else settings_content
+                    )
+                    if git_provider.is_supported("gfm_markdown"):
+                        body += (
+                            "\n\n<details><summary>Configuration content:</summary>\n\n"
+                            f"```toml\n{configuration_file_content}\n```\n\n</details>"
+                        )
+                    else:
+                        body += f"\n\n**Configuration content:**\n\n```toml\n{configuration_file_content}\n```\n\n"
+                get_logger().warning("Sending a 'configuration error' comment to the PR", artifact={'body': body})
                 # git_provider.publish_comment(body)
                 if hasattr(git_provider, 'publish_persistent_comment'):
+                    # Use a per-scope name so multiple settings errors (e.g. global + local) don't
+                    # collide: in GitHub check-run mode the name keys the check run, so a shared name
+                    # would make later errors overwrite earlier ones and hide failures.
                     git_provider.publish_persistent_comment(body,
                                                             initial_header=header,
                                                             update_header=False,
-                                                            final_update_message=False)
+                                                            final_update_message=False,
+                                                            name=f"config-errors-{config_type}")
                 else:
                     git_provider.publish_comment(body)
     except Exception as e:
-        get_logger().exception(f"Failed to handle configurations errors", e)
-
-
-def set_claude_model():
-    """
-    set the claude-sonnet-3.5 model easily (even by users), just by stating: --config.model='claude-3-5-sonnet'
-    """
-    model_claude = "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0"
-    get_settings().set('config.model', model_claude)
-    get_settings().set('config.model_weak', model_claude)
-    get_settings().set('config.fallback_models', [model_claude])
+        get_logger().exception("Failed to handle configurations errors", e)
