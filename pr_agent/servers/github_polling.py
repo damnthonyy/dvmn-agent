@@ -1,20 +1,154 @@
 import asyncio
+import copy
+import math
 import multiprocessing
-import time
 import traceback
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import aiohttp
-import requests
+from starlette_context import request_cycle_context
 
 from pr_agent.agent.pr_agent import PRAgent
-from pr_agent.config_loader import get_settings
+from pr_agent.agent.request_policy import RequestOutcome
+from pr_agent.algo.ai_handlers.litellm_helpers import (
+    DEFAULT_CALLBACK_TIMEOUT_SECONDS,
+    drain_litellm_callbacks,
+    litellm_callbacks_registered,
+)
+from pr_agent.config_loader import get_settings, global_settings
 from pr_agent.git_providers import get_git_provider
 from pr_agent.log import LoggingFormat, get_logger, setup_logger
 
 setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
 NOTIFICATION_URL = "https://api.github.com/notifications"
+DEFAULT_POLLING_REQUEST_TIMEOUT = 10
+MAX_POLLING_REQUEST_TIMEOUT = 60
+POLLING_CAPACITY_CHECK_INTERVAL = 0.25
+POLLING_COMMENT_SCAN_LIMIT = 4
+
+
+class _PollingWorkerStartError(RuntimeError):
+    """Stop dispatch when child startup leaves process state uncertain."""
+
+
+class _InvalidPaginationMetadata(ValueError):
+    """Reject untrusted pagination metadata without retaining its contents."""
+
+
+class _CommentPaginationDrift(_InvalidPaginationMetadata):
+    """Keep a notification retryable when bounded scans cannot obtain one stable tail."""
+
+
+_RETRY_POLLING_NOTIFICATION = object()
+
+
+def _pr_comments_url(pr_url: str) -> str:
+    """Map an API pull request URL to its issue comments URL."""
+    base, sep, number = pr_url.rpartition("/pulls/")
+    return f"{base}/issues/{number}/comments" if sep else f"{pr_url}/comments"
+
+
+def _get_polling_request_timeout() -> float:
+    """Bound the timeout for notification fallback requests."""
+    value = global_settings.get("github.polling_request_timeout", DEFAULT_POLLING_REQUEST_TIMEOUT)
+    try:
+        timeout = float(value) if not isinstance(value, bool) else 0.0
+    except (TypeError, ValueError, OverflowError):
+        timeout = 0.0
+    if not math.isfinite(timeout) or timeout <= 0:
+        get_logger().warning(
+            f"Invalid github.polling_request_timeout; using {DEFAULT_POLLING_REQUEST_TIMEOUT} seconds"
+        )
+        return float(DEFAULT_POLLING_REQUEST_TIMEOUT)
+    if timeout > MAX_POLLING_REQUEST_TIMEOUT:
+        get_logger().warning(f"Capping github.polling_request_timeout at {MAX_POLLING_REQUEST_TIMEOUT} seconds")
+    return min(timeout, float(MAX_POLLING_REQUEST_TIMEOUT))
+
+
+def _remaining_polling_timeout(deadline: float) -> float:
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        raise asyncio.TimeoutError("Comment history request timed out")
+    return remaining
+
+
+def _comment_page_number(response, relation: str) -> int | None:
+    links = response.links.getall(relation, [])
+    if not links:
+        return None
+    if len(links) != 1:
+        raise _InvalidPaginationMetadata("Ambiguous comment page relation")
+    values = links[0]["url"].query.getall("page", [])
+    if (len(values) != 1 or not values[0].isascii() or not values[0].isdecimal()
+            or int(values[0]) < 1):
+        raise _InvalidPaginationMetadata("Invalid comment page number")
+    return int(values[0])
+
+
+async def _fetch_comment_page(session, url, headers, deadline: float, page=None) -> tuple[list, int | None, int | None]:
+    """Read page numbers from Link while requesting only the original endpoint."""
+    params = {"per_page": 100}
+    if page is not None:
+        params["page"] = page
+    async with session.get(
+        url, headers=headers, params=params,
+        timeout=aiohttp.ClientTimeout(total=_remaining_polling_timeout(deadline)),
+        allow_redirects=True, max_redirects=30,
+    ) as response:
+        response.raise_for_status()
+        if not 200 <= response.status < 300:
+            raise _InvalidPaginationMetadata("Unexpected comment history response status")
+        comments = await response.json(content_type=None)
+        last_page = _comment_page_number(response, "last")
+        next_page = _comment_page_number(response, "next")
+        _remaining_polling_timeout(deadline)
+    if not isinstance(comments, list):
+        raise ValueError("Expected a list of pull request comments")
+    return comments, last_page, next_page
+
+
+async def _fetch_comment_history_scan(session, url, headers, deadline: float) -> list | None:
+    """Return a tail, or retry if the requested pages changed during the scan."""
+    comments, last_page, next_page = await _fetch_comment_page(session, url, headers, deadline)
+    if next_page is None:
+        if last_page not in (None, 1):
+            raise _InvalidPaginationMetadata("Missing next comment page")
+        return comments[-POLLING_COMMENT_SCAN_LIMIT:]
+    if last_page is None or next_page != 2 or last_page < next_page:
+        raise _InvalidPaginationMetadata("Missing or invalid last comment page")
+
+    comments, current_last, next_page = await _fetch_comment_page(session, url, headers, deadline, last_page)
+    if not comments or next_page is not None or current_last not in (None, last_page):
+        return None
+    if len(comments) >= POLLING_COMMENT_SCAN_LIMIT:
+        return comments[-POLLING_COMMENT_SCAN_LIMIT:]
+
+    previous, current_last, next_page = await _fetch_comment_page(session, url, headers, deadline, last_page - 1)
+    if not previous or next_page != last_page or current_last not in (None, last_page):
+        return None
+    refreshed, current_last, next_page = await _fetch_comment_page(session, url, headers, deadline, last_page)
+    if (next_page is not None or current_last not in (None, last_page)
+            or [comment["id"] for comment in refreshed] != [comment["id"] for comment in comments]
+            or {comment["id"] for comment in previous} & {comment["id"] for comment in refreshed}):
+        return None
+    return (previous + refreshed)[-POLLING_COMMENT_SCAN_LIMIT:]
+
+
+async def _fetch_comment_history(session, url, headers) -> list:
+    """Fetch the newest four comments, retrying one changed scan within one deadline."""
+    deadline = asyncio.get_running_loop().time() + _get_polling_request_timeout()
+    for attempt in range(2):
+        try:
+            comments = await _fetch_comment_history_scan(session, url, headers, deadline)
+        except asyncio.TimeoutError as error:
+            if attempt:
+                raise _CommentPaginationDrift("Comment history changed during polling") from error
+            raise
+        if comments is not None:
+            return comments
+    raise _CommentPaginationDrift("Comment history changed during polling")
 
 
 async def mark_notification_as_read(headers, notification, session):
@@ -46,41 +180,93 @@ async def async_handle_request(pr_url, rest_of_comment, comment_id, git_provider
     )
     return success
 
+async def _handle_request_and_drain(pr_url, rest_of_comment, comment_id, git_provider):
+    """
+    Run the request, then flush litellm's deferred callbacks before the loop closes.
+
+    This runs in a short-lived child process, so asyncio.run() below tears the loop
+    down and the process exits immediately afterwards - without the drain the last
+    completion's callback is dropped.
+    """
+    try:
+        return await async_handle_request(pr_url, rest_of_comment, comment_id, git_provider)
+    finally:
+        if litellm_callbacks_registered():
+            await drain_litellm_callbacks(
+                get_settings().litellm.get("callback_timeout_seconds", DEFAULT_CALLBACK_TIMEOUT_SECONDS)
+            )
+
+
 def run_handle_request(pr_url, rest_of_comment, comment_id, git_provider):
-    return asyncio.run(async_handle_request(pr_url, rest_of_comment, comment_id, git_provider))
+    return asyncio.run(_handle_request_and_drain(pr_url, rest_of_comment, comment_id, git_provider))
+
+
+def _polling_request_settings():
+    """Clone global settings with the polling-mode overrides applied.
+
+    Applying the overrides here instead of in ``polling_loop`` makes them reach
+    the task regardless of the multiprocessing start method: fork children
+    inherit the parent's globals, spawn/forkserver children do not - and
+    forkserver is the Linux default from Python 3.14.
+    """
+    settings = copy.deepcopy(global_settings)
+    settings.set("CONFIG.PUBLISH_OUTPUT_PROGRESS", False)
+    settings.set("pr_description.publish_description_as_comment", True)
+    return settings
+
+
+@contextmanager
+def _polling_settings_scope():
+    """request_cycle_context with a guaranteed reset: its bare yield (unfixed
+    upstream as of starlette-context 0.5.1) skips the ContextVar reset when an
+    exception crosses the with-body, so enter and exit are driven explicitly
+    and the reset runs on any exit, BaseException included.
+    """
+    cm = request_cycle_context({"settings": _polling_request_settings()})
+    cm.__enter__()
+    try:
+        yield
+    finally:
+        cm.__exit__(None, None, None)
 
 
 def process_comment_sync(pr_url, rest_of_comment, comment_id):
     try:
-        # Run the async handle_request in a separate function
-        git_provider = get_git_provider()(pr_url=pr_url)
-        success = run_handle_request(pr_url, rest_of_comment, comment_id, git_provider)
+        with _polling_settings_scope():
+            # Run the async handle_request in a separate function
+            git_provider = get_git_provider()(pr_url=pr_url)
+            run_handle_request(pr_url, rest_of_comment, comment_id, git_provider)
     except Exception as e:
         get_logger().error(f"Error processing comment: {e}", artifact={"traceback": traceback.format_exc()})
 
 
 async def process_comment(pr_url, rest_of_comment, comment_id):
     try:
-        git_provider = get_git_provider()(pr_url=pr_url)
-        git_provider.set_pr(pr_url)
-        agent = PRAgent()
-        success = await agent.handle_request(
-            pr_url,
-            rest_of_comment,
-            notify=lambda: git_provider.add_eyes_reaction(comment_id)
-        )
+        with _polling_settings_scope():
+            git_provider = get_git_provider()(pr_url=pr_url)
+            git_provider.set_pr(pr_url)
+            agent = PRAgent()
+            result = await agent.handle_request(
+                pr_url,
+                rest_of_comment,
+                notify=lambda: git_provider.add_eyes_reaction(comment_id)
+            )
+            if result is RequestOutcome.SKIPPED:
+                return
         get_logger().info(f"Finished processing comment for PR: {pr_url}")
     except Exception as e:
         get_logger().error(f"Error processing comment: {e}", artifact={"traceback": traceback.format_exc()})
 
-async def is_valid_notification(notification, headers, handled_ids, session, user_id):
+async def is_valid_notification(
+    notification, headers, handled_ids, session, user_id, added_handled_ids=None
+):
     try:
         if 'reason' in notification and notification['reason'] == 'mention':
             if 'subject' in notification and notification['subject']['type'] == 'PullRequest':
                 pr_url = notification['subject']['url']
                 latest_comment = notification['subject']['latest_comment_url']
                 if not latest_comment or not isinstance(latest_comment, str):
-                    get_logger().debug(f"no latest_comment")
+                    get_logger().debug("no latest_comment")
                     return False, handled_ids
                 async with session.get(latest_comment, headers=headers) as comment_response:
                     check_prev_comments = False
@@ -89,21 +275,23 @@ async def is_valid_notification(notification, headers, handled_ids, session, use
                         comment = await comment_response.json()
                         if 'id' in comment:
                             if comment['id'] in handled_ids:
-                                get_logger().debug(f"comment['id'] in handled_ids")
+                                get_logger().debug("comment['id'] in handled_ids")
                                 return False, handled_ids
                             else:
                                 handled_ids.add(comment['id'])
+                                if added_handled_ids is not None:
+                                    added_handled_ids.add(comment['id'])
                         if 'user' in comment and 'login' in comment['user']:
                             if comment['user']['login'] == user_id:
-                                get_logger().debug(f"comment['user']['login'] == user_id")
+                                get_logger().debug("comment['user']['login'] == user_id")
                                 check_prev_comments = True
                         comment_body = comment.get('body', '')
                         if not comment_body:
-                            get_logger().debug(f"no comment_body")
+                            get_logger().debug("no comment_body")
                             check_prev_comments = True
                         else:
                             if user_tag not in comment_body:
-                                get_logger().debug(f"user_tag not in comment_body")
+                                get_logger().debug("user_tag not in comment_body")
                                 check_prev_comments = True
                             else:
                                 get_logger().info(f"Polling, pr_url: {pr_url}",
@@ -113,11 +301,25 @@ async def is_valid_notification(notification, headers, handled_ids, session, use
                             return True, handled_ids, comment, comment_body, pr_url, user_tag
                         else: # we could not find the user tag in the latest comment. Check previous comments
                             # get all comments in the PR
-                            requests_url = f"{pr_url}/comments".replace("pulls", "issues")
-                            comments_response = requests.get(requests_url, headers=headers)
-                            comments = comments_response.json()[::-1]
-                            max_comment_to_scan = 4
-                            for comment in comments[:max_comment_to_scan]:
+                            requests_url = _pr_comments_url(pr_url)
+                            try:
+                                comments = (await _fetch_comment_history(session, requests_url, headers))[::-1]
+                            except _CommentPaginationDrift:
+                                if 'id' in comment:
+                                    handled_ids.discard(comment['id'])
+                                    if added_handled_ids is not None:
+                                        added_handled_ids.discard(comment['id'])
+                                get_logger().warning(
+                                    f"Deferring polling notification after concurrent comment changes for PR: "
+                                    f"{pr_url}"
+                                )
+                                return False, handled_ids, _RETRY_POLLING_NOTIFICATION
+                            except _InvalidPaginationMetadata:
+                                get_logger().warning(
+                                    f"Ignoring invalid comment pagination metadata for PR: {pr_url}"
+                                )
+                                return False, handled_ids
+                            for comment in comments[:POLLING_COMMENT_SCAN_LIMIT]:
                                 if 'user' in comment and 'login' in comment['user']:
                                     if comment['user']['login'] == user_id:
                                         continue
@@ -136,10 +338,62 @@ async def is_valid_notification(notification, headers, handled_ids, session, use
 
         return False, handled_ids
     except Exception as e:
-        get_logger().exception(f"Error processing polling notification",
+        get_logger().exception("Error processing polling notification",
                                artifact={"notification": notification, "error": e})
         return False, handled_ids
 
+
+def _reap_finished_processes(active_processes):
+    """Release completed workers without waiting for live ones."""
+    for process in active_processes[:]:
+        if not process.is_alive():
+            process.join(timeout=0)
+            process.close()
+            active_processes.remove(process)
+
+
+async def _start_queued_processes(task_queue, max_allowed_parallel_tasks, active_processes):
+    """Keep the batch limit, waiting for capacity shared across polling iterations."""
+    if max_allowed_parallel_tasks <= 0:
+        raise ValueError("The polling process limit must be positive")
+    overflow = len(task_queue) - max_allowed_parallel_tasks
+    if overflow > 0:
+        get_logger().error(f"Dropping {overflow} tasks from polling session")
+        for _ in range(overflow):
+            task_queue.pop()
+
+    waiting_logged = False
+    try:
+        while task_queue:
+            _reap_finished_processes(active_processes)
+            if len(active_processes) >= max_allowed_parallel_tasks:
+                if not waiting_logged:
+                    get_logger().info(
+                        f"Polling dispatch waiting for capacity: {len(active_processes)} workers active, "
+                        f"{len(task_queue)} tasks queued"
+                    )
+                    waiting_logged = True
+                await asyncio.sleep(POLLING_CAPACITY_CHECK_INTERVAL)
+                continue
+            func, args = task_queue[0]
+            process = multiprocessing.Process(target=func, args=args)
+            try:
+                process.start()
+            except BaseException as exc:
+                # Treat a PID-bearing child as potentially dispatched; never retry its task.
+                if process.pid is not None:
+                    active_processes.append(process)
+                    task_queue.popleft()
+                else:
+                    process.close()
+                if isinstance(exc, Exception):
+                    raise _PollingWorkerStartError("Polling worker startup failed; stopping dispatch") from exc
+                raise
+            active_processes.append(process)
+            task_queue.popleft()
+    finally:
+        if task_queue:
+            get_logger().error(f"Polling dispatch stopped with {len(task_queue)} tasks not dispatched")
 
 
 async def polling_loop():
@@ -151,8 +405,6 @@ async def polling_loop():
     last_modified = [None]
     git_provider = get_git_provider()()
     user_id = git_provider.get_user_id()
-    get_settings().set("CONFIG.PUBLISH_OUTPUT_PROGRESS", False)
-    get_settings().set("pr_description.publish_description_as_comment", True)
 
     try:
         deployment_type = get_settings().github.deployment_type
@@ -166,8 +418,11 @@ async def polling_loop():
     if not token:
         raise ValueError("User token must be set to get notifications")
 
+    active_processes = []
     async with aiohttp.ClientSession() as session:
         while True:
+            task_queue = deque()
+            dispatch_started = False
             try:
                 await asyncio.sleep(5)
                 headers = {
@@ -191,15 +446,37 @@ async def polling_loop():
                         if not notifications:
                             continue
                         get_logger().info(f"Received {len(notifications)} notifications")
-                        task_queue = deque()
                         for notification in notifications:
                             if not notification:
                                 continue
-                            # mark notification as read
-                            await mark_notification_as_read(headers, notification, session)
+                            added_handled_ids = set()
+                            output = await is_valid_notification(
+                                notification,
+                                headers,
+                                handled_ids,
+                                session,
+                                user_id,
+                                added_handled_ids,
+                            )
+                            if (
+                                len(output) > 2
+                                and output[0] is False
+                                and output[2] is _RETRY_POLLING_NOTIFICATION
+                            ):
+                                # Force an unconditional notification fetch next iteration because
+                                # unread notifications may not update GitHub's Last-Modified.
+                                last_modified[0] = None
+                                continue
 
+                            try:
+                                await mark_notification_as_read(headers, notification, session)
+                            except Exception:
+                                handled_ids.difference_update(added_handled_ids)
+                                # Reset conditional-fetch state because an unread notification may
+                                # retain its modification timestamp.
+                                last_modified[0] = None
+                                raise
                             handled_ids.add(notification['id'])
-                            output = await is_valid_notification(notification, headers, handled_ids, session, user_id)
                             if output[0]:
                                 _, handled_ids, comment, comment_body, pr_url, user_tag = output
                                 rest_of_comment = comment_body.split(user_tag)[1].strip()
@@ -207,35 +484,30 @@ async def polling_loop():
 
                                 # Add to the task queue
                                 get_logger().info(
-                                    f"Adding comment processing to task queue for PR, {pr_url}, comment_body: {comment_body}")
+                                    f"Adding comment processing to task queue for PR, {pr_url},"
+                                    f" comment_body: {comment_body}")
                                 task_queue.append((process_comment_sync, (pr_url, rest_of_comment, comment_id)))
                                 get_logger().info(f"Queued comment processing for PR: {pr_url}")
                             else:
-                                get_logger().debug(f"Skipping comment processing for PR")
+                                get_logger().debug("Skipping comment processing for PR")
 
                         max_allowed_parallel_tasks = 10
                         if task_queue:
-                            processes = []
-                            for i, (func, args) in enumerate(task_queue):  # Create  parallel tasks
-                                p = multiprocessing.Process(target=func, args=args)
-                                processes.append(p)
-                                p.start()
-                                if i > max_allowed_parallel_tasks:
-                                    get_logger().error(
-                                        f"Dropping {len(task_queue) - max_allowed_parallel_tasks} tasks from polling session")
-                                    break
-                            task_queue.clear()
-
-                            # Don't wait for all processes to complete. Move on to the next iteration
-                            # for p in processes:
-                            #     p.join()
+                            dispatch_started = True
+                            await _start_queued_processes(task_queue, max_allowed_parallel_tasks, active_processes)
 
                     elif response.status != 304:
                         print(f"Failed to fetch notifications. Status code: {response.status}")
 
+            except _PollingWorkerStartError:
+                raise
             except Exception as e:
                 get_logger().error(f"Polling exception during processing of a notification: {e}",
                                    artifact={"traceback": traceback.format_exc()})
+            finally:
+                if task_queue and not dispatch_started:
+                    get_logger().error(f"Polling dispatch stopped with {len(task_queue)} tasks not dispatched")
+                _reap_finished_processes(active_processes)
 
 
 if __name__ == '__main__':
