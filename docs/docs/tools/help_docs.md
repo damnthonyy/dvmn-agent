@@ -1,3 +1,19 @@
+---
+title: "Help Docs"
+sidebar_position: 10
+---
+
+:::warning[`/help_docs` is currently disabled]
+As of **v0.36.1**, the `/help_docs` command is temporarily disabled as a mitigation for a
+credential-exposure vulnerability ([#2445](https://github.com/The-PR-Agent/pr-agent/issues/2445)):
+the command accepted an untrusted runtime override of its git clone target, and the clone-URL
+host validation only checked substring containment, so a host that merely *contained* the
+allowed host could receive the git provider token.
+
+The command is not registered in `PRAgent`, so invoking it has no effect on any provider. The
+page below documents the tool as it behaves once it is re-enabled.
+:::
+
 ## Overview
 
 The `help_docs` tool can answer a free-text question based on a git documentation folder.
@@ -8,7 +24,7 @@ It can be invoked manually by commenting on any PR or Issue:
 /help_docs "..."
 ```
 
-Or configured to be triggered automatically when a [new issue is opened](#run-as-a-github-action).
+Or configured to be triggered automatically when a [new issue is opened](../installation/github.md#run-as-a-github-action).
 
 The tool assumes by default that the documentation is located in the root of the repository, at `/docs` folder.
 However, this can be customized by setting the `docs_path` configuration option:
@@ -27,15 +43,15 @@ See more configuration options in the [Configuration options](#configuration-opt
 
 [//]: # (#### Asking a question about this repository:)
 
-[//]: # (![help_docs on the documentation of this repository]&#40;https://codium.ai/images/pr_agent/help_docs_comment.png&#41;{width=512})
+[//]: # (<img src="/img/help_docs_comment.png" alt="help_docs on the documentation of this repository" width="512" />)
 
 **Asking a question about another repository**
 
-![help_docs on the documentation of another repository](https://codium.ai/images/pr_agent/help_docs_comment_explicit_git.png){width=512}
+<img src="/img/help_docs_comment_explicit_git.png" alt="help_docs on the documentation of another repository" width="512" />
 
 **Response**:
 
-![help_docs response](https://codium.ai/images/pr_agent/help_docs_response.png){width=512}
+<img src="/img/help_docs_response.png" alt="help_docs response" width="512" />
 
 ## Run automatically when a new issue is opened
 
@@ -44,7 +60,7 @@ This can be useful, for example, for providing immediate feedback to users who o
 
 Here's how:
 
-1) Follow the steps depicted under [Run as a Github Action](../installation/github.md#run-as-a-github-action) to create a new workflow, such as:`.github/workflows/help_docs.yml`:
+1) Follow the steps depicted under [Run as a GitHub Action](../installation/github.md#run-as-a-github-action) to create a new workflow, such as:`.github/workflows/help_docs.yml`:
 
 2) Edit your yaml file to the following:
 
@@ -100,7 +116,11 @@ When a new issue is opened, you should see a comment from `github-actions` bot w
 
 ## Configuration options
 
+<<<<<<< HEAD
 Under the section `pr_help_docs`, the [configuration file](https://github.com/the-dvmn-agent/dvmn-agent/blob/main/pr_agent/settings/configuration.toml#L199) contains options to customize the 'help docs' tool:
+=======
+Under the section `pr_help_docs`, the [configuration file](https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/settings/configuration.toml) contains options to customize the 'help docs' tool:
+>>>>>>> upstream/main
 
 - `repo_url`: If not overwritten, will use the repo from where the context came from (issue or PR), otherwise - use the given repo as context.
 - `repo_default_branch`: The branch to use in case repo_url overwritten, otherwise - has no effect.
