@@ -1,13 +1,31 @@
+from codecs import BOM_UTF16_BE
+
 import pytest
 
-from pr_agent.algo.git_patch_processing import extend_patch
-from pr_agent.algo.pr_processing import pr_generate_extended_diff
+from pr_agent.algo.git_patch_processing import (
+    RE_HUNK_HEADER,
+    decode_if_bytes,
+    extend_patch,
+    extract_hunk_headers,
+    extract_hunk_lines_from_patch,
+)
+from pr_agent.algo.pr_processing import get_pr_multi_diffs, pr_generate_extended_diff
 from pr_agent.algo.token_handler import TokenHandler
+from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.algo.utils import load_large_diff
 from pr_agent.config_loader import get_settings
 
 get_settings(use_context=False).set("CONFIG.CLI_MODE", True)
 get_settings(use_context=False).config.allow_dynamic_context = False
+
+
+def test_decode_utf16_big_endian_with_bom():
+    content = BOM_UTF16_BE + "hello world".encode("utf-16-be")
+    assert decode_if_bytes(content) == "hello world"
+
+
+def test_decode_latin1_without_bom():
+    assert decode_if_bytes(b"caf\xe9") == "caf\xe9"
 
 
 class TestExtendPatch:
@@ -51,7 +69,7 @@ class TestExtendPatch:
         original_file_str = 'line1\nline2\nline3\nline4\nline5'
         patch_str = '@@ -2,3 +2,3 @@ init()\n-line2\n+new_line2\n line3\n line4'
 
-        for num_lines in [1, 2, 3]: # check that even if we are over the number of lines in the file, the function still works
+        for num_lines in [1, 2, 3]:  # still works if extra lines exceed the file
             expected_output = '\n@@ -1,5 +1,5 @@ init()\n line1\n-line2\n+new_line2\n line3\n line4\n line5'
             actual_output = extend_patch(original_file_str, patch_str,
                                          patch_extra_lines_before=num_lines, patch_extra_lines_after=num_lines)
@@ -60,18 +78,17 @@ class TestExtendPatch:
     # Tests the functionality of extending a patch with multiple hunks.
     def test_multiple_hunks(self):
         original_file_str = 'line1\nline2\nline3\nline4\nline5\nline6'
-        patch_str = '@@ -2,3 +2,3 @@ init()\n-line2\n+new_line2\n line3\n line4\n@@ -4,1 +4,1 @@ init2()\n-line4\n+new_line4'  # noqa: E501
+        patch_str = '@@ -2,3 +2,3 @@ init()\n-line2\n+new_line2\n line3\n line4\n@@ -5,1 +5,1 @@ init2()\n-line5\n+new_line5'  # noqa: E501
         num_lines = 1
         original_allow_dynamic_context = get_settings(use_context=False).config.allow_dynamic_context
 
         get_settings(use_context=False).config.allow_dynamic_context = False
-        expected_output = '\n@@ -1,5 +1,5 @@ init()\n line1\n-line2\n+new_line2\n line3\n line4\n line5\n\n@@ -3,3 +3,3 @@ init2()\n line3\n-line4\n+new_line4\n line5' # noqa: E501
+        expected_output = '\n@@ -1,4 +1,4 @@ init()\n line1\n-line2\n+new_line2\n line3\n line4\n\n@@ -5,2 +5,2 @@ init2()\n-line5\n+new_line5\n line6' # noqa: E501
         actual_output = extend_patch(original_file_str, patch_str,
                                      patch_extra_lines_before=num_lines, patch_extra_lines_after=num_lines)
         assert actual_output == expected_output
 
         get_settings(use_context=False).config.allow_dynamic_context = True
-        expected_output = '\n@@ -1,5 +1,5 @@ init()\n line1\n-line2\n+new_line2\n line3\n line4\n line5\n\n@@ -3,3 +3,3 @@ init2()\n line3\n-line4\n+new_line4\n line5' # noqa: E501
         actual_output = extend_patch(original_file_str, patch_str,
                                      patch_extra_lines_before=num_lines, patch_extra_lines_after=num_lines)
         assert actual_output == expected_output
@@ -88,22 +105,84 @@ class TestExtendPatch:
         num_lines=1
 
         get_settings(use_context=False).config.allow_dynamic_context = True
-        actual_output = extend_patch(original_file_str, patch_str,
-                                     patch_extra_lines_before=num_lines, patch_extra_lines_after=num_lines, new_file_str=new_file_str)
-        expected_output='\n@@ -1,10 +1,10 @@ \n def foo():\n     line(0)\n     line(1)\n     line(2)\n     line(3)\n     line(4)\n     line(5)\n     line(6)\n     line(7)\n-    line(8)\n+    new_line(8)'
+        actual_output = extend_patch(
+            original_file_str,
+            patch_str,
+            patch_extra_lines_before=num_lines,
+            patch_extra_lines_after=num_lines,
+            new_file_str=new_file_str,
+        )
+        expected_output = (
+            "\n@@ -1,10 +1,10 @@ \n def foo():\n     line(0)\n     line(1)\n"
+            "     line(2)\n     line(3)\n     line(4)\n     line(5)\n     line(6)\n"
+            "     line(7)\n-    line(8)\n+    new_line(8)"
+        )
         assert actual_output == expected_output
 
         get_settings(use_context=False).config.allow_dynamic_context = False
         actual_output2 = extend_patch(original_file_str, patch_str,
                                      patch_extra_lines_before=1, patch_extra_lines_after=1)
-        expected_output_no_dynamic_context = '\n@@ -9,2 +9,2 @@ def foo():\n     line(7)\n-    line(8)\n+    new_line(8)'
+        expected_output_no_dynamic_context = (
+            "\n@@ -9,2 +9,2 @@ def foo():\n     line(7)\n-    line(8)\n+    new_line(8)"
+        )
         assert actual_output2 == expected_output_no_dynamic_context
 
         get_settings(use_context=False).config.allow_dynamic_context = False
         actual_output3 = extend_patch(original_file_str, patch_str,
                                      patch_extra_lines_before=3, patch_extra_lines_after=3)
-        expected_output_no_dynamic_context = '\n@@ -7,4 +7,4 @@ def foo():\n     line(5)\n     line(6)\n     line(7)\n-    line(8)\n+    new_line(8)'
+        expected_output_no_dynamic_context = (
+            "\n@@ -7,4 +7,4 @@ def foo():\n     line(5)\n     line(6)\n     line(7)\n"
+            "-    line(8)\n+    new_line(8)"
+        )
         assert actual_output3 == expected_output_no_dynamic_context
+
+    @pytest.mark.parametrize("section_header", ["", "   "])
+    def test_headerless_hunk_uses_fixed_context_with_new_file(self, monkeypatch, section_header):
+        settings = get_settings(use_context=False)
+        monkeypatch.setattr(settings.config, "allow_dynamic_context", True)
+        monkeypatch.setattr(settings.config, "max_extra_lines_before_dynamic_context", 10)
+        preceding = [f"    line{i}" for i in range(1, 11)]
+        original = "\n".join([*preceding, "old"])
+        new = "\n".join([*preceding, "new"])
+        patch = f"@@ -11 +11 @@{section_header}\n-old\n+new"
+
+        extended = extend_patch(original, patch, patch_extra_lines_before=5,
+                                patch_extra_lines_after=0, new_file_str=new)
+
+        assert extended.splitlines()[1].startswith("@@ -6,6 +6,6 @@")
+        assert extended.splitlines()[2:] == [*(f"     line{i}" for i in range(6, 11)), "-old", "+new"]
+
+    @pytest.mark.parametrize("new_header_line", ["anchor", "changed anchor"])
+    def test_dynamic_header_missing_or_mismatched_uses_fixed_context(self, monkeypatch, new_header_line):
+        settings = get_settings(use_context=False)
+        monkeypatch.setattr(settings.config, "allow_dynamic_context", True)
+        monkeypatch.setattr(settings.config, "max_extra_lines_before_dynamic_context", 10)
+        original_lines = ["anchor", *(f"line{i}" for i in range(2, 11)), "old"]
+        new_lines = [new_header_line, *original_lines[1:-1], "new"]
+        header = "missing" if new_header_line == "anchor" else "anchor"
+        patch = f"@@ -11 +11 @@ {header}\n-old\n+new"
+
+        extended = extend_patch("\n".join(original_lines), patch, patch_extra_lines_before=5,
+                                patch_extra_lines_after=0, new_file_str="\n".join(new_lines))
+
+        assert extended.splitlines()[1].startswith("@@ -6,6 +6,6 @@")
+        assert extended.splitlines()[2:7] == [*(f" line{i}" for i in range(6, 11))]
+
+    def test_dynamic_context_resets_for_headerless_second_hunk(self, monkeypatch):
+        settings = get_settings(use_context=False)
+        monkeypatch.setattr(settings.config, "allow_dynamic_context", True)
+        monkeypatch.setattr(settings.config, "max_extra_lines_before_dynamic_context", 10)
+        original_lines = ["def first():", *(f"line{i}" for i in range(2, 11)), "old1",
+                          *(f"line{i}" for i in range(12, 22)), "old2"]
+        new_lines = ["new1" if line == "old1" else "new2" if line == "old2" else line
+                     for line in original_lines]
+        patch = "@@ -11 +11 @@ def first():\n-old1\n+new1\n@@ -22 +22 @@\n-old2\n+new2"
+
+        extended = extend_patch("\n".join(original_lines), patch, patch_extra_lines_before=5,
+                                patch_extra_lines_after=0, new_file_str="\n".join(new_lines))
+
+        hunk_headers = [line for line in extended.splitlines() if line.startswith("@@")]
+        assert hunk_headers == ["@@ -1,11 +1,11 @@ ", "@@ -17,6 +17,6 @@ "]
 
 
 
@@ -130,15 +209,34 @@ class TestExtendedPatchMoreLines:
         # Create a list of languages with files containing base_file and patch data
         return [
             {
-                'files': [
-                    self.File(base_file="line000\nline00\nline0\nline1\noriginal content\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10",
-                              patch="@@ -5,5 +5,5 @@\n-original content\n+modified content\n line2\n line3\n line4\n line5",
-                              head_file="line000\nline00\nline0\nline1\nmodified content\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10",
-                              filename="file1"),
-                    self.File(base_file="original content\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10",
-                              patch="@@ -6,5 +6,5 @@\nline6\nline7\nline8\n-line9\n+modified line9\nline10",
-                              head_file="original content\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nmodified line9\nline10",
-                              filename="file2")
+                "files": [
+                    self.File(
+                        base_file=(
+                            "line000\nline00\nline0\nline1\noriginal content\n"
+                            "line2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10"
+                        ),
+                        patch=(
+                            "@@ -5,5 +5,5 @@\n-original content\n+modified content\n"
+                            " line2\n line3\n line4\n line5"
+                        ),
+                        head_file=(
+                            "line000\nline00\nline0\nline1\nmodified content\n"
+                            "line2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10"
+                        ),
+                        filename="file1",
+                    ),
+                    self.File(
+                        base_file=(
+                            "original content\nline2\nline3\nline4\nline5\n"
+                            "line6\nline7\nline8\nline9\nline10"
+                        ),
+                        patch="@@ -6,5 +6,5 @@\nline6\nline7\nline8\n-line9\n+modified line9\nline10",
+                        head_file=(
+                            "original content\nline2\nline3\nline4\nline5\n"
+                            "line6\nline7\nline8\nmodified line9\nline10"
+                        ),
+                        filename="file2",
+                    ),
                 ]
             }
         ]
@@ -163,20 +261,24 @@ class TestExtendedPatchMoreLines:
         )
 
         p0_extended = patches_extended_with_extra_lines[0].strip()
-        assert p0_extended == "## File: 'file1'\n\n@@ -3,8 +3,8 @@ \n line0\n line1\n-original content\n+modified content\n line2\n line3\n line4\n line5\n line6"
+        assert p0_extended == (
+            "## File: 'file1'\n\n@@ -3,8 +3,8 @@ \n line0\n line1\n"
+            "-original content\n+modified content\n line2\n line3\n line4\n line5\n line6"
+        )
 
 class TestLoadLargeDiff:
-    def test_no_newline(self):
-        patch = load_large_diff("test.py",
-                                """\
-                                old content 1
-                                some new content
-                                another line
-                                """,
-                                """
-                                old content 1
-                                old content 2""")
+    @pytest.mark.parametrize("old_ending", ["", "\n"])
+    @pytest.mark.parametrize("new_ending", ["", "\n"])
+    def test_no_newline(self, old_ending, new_ending):
+        original = "old content 1\nold content 2" + old_ending
+        new = "old content 1\nsome new content\nanother line" + new_ending
+        expected = (
+            "@@ -1,2 +1,3 @@\n old content 1\n-old content 2\n"
+            "+some new content\n+another line\n"
+        )
+        assert load_large_diff("test.py", new, original) == expected
 
+<<<<<<< HEAD
         patch_expected = (
             "--- \n"
             "+++ \n"
@@ -194,3 +296,159 @@ class TestLoadLargeDiff:
         assert load_large_diff("test.py", None, None) == ""
         assert (load_large_diff("test.py", "content\n", "") ==
                 '--- \n+++ \n@@ -1 +1 @@\n-\n+content\n')
+=======
+    @pytest.mark.parametrize("original", [None, ""])
+    @pytest.mark.parametrize("new", [None, ""])
+    def test_empty_inputs(self, original, new):
+        assert load_large_diff("test.py", new, original) == ""
+
+    @pytest.mark.parametrize("empty", [None, ""])
+    @pytest.mark.parametrize("content", ["content\n", "  \n", "\n"])
+    def test_empty_sides_have_zero_line_ranges(self, empty, content):
+        assert load_large_diff("test.py", content, empty) == "@@ -0,0 +1 @@\n+" + content
+        assert load_large_diff("test.py", empty, content) == "@@ -1 +0,0 @@\n-" + content
+
+    @pytest.mark.parametrize("ending", ["", "\n", "\r\n"])
+    @pytest.mark.parametrize("whitespace", ["  ", "\t"])
+    def test_preserves_trailing_spaces_and_tabs(self, whitespace, ending):
+        original = "value" + ending
+        new = "value" + whitespace + ending
+        line_ending = ending or "\n"
+        assert load_large_diff("test.py", new, original) == (
+            f"@@ -1 +1 @@\n-value{line_ending}+value{whitespace}{line_ending}"
+        )
+        assert load_large_diff("test.py", original, new) == (
+            f"@@ -1 +1 @@\n-value{whitespace}{line_ending}+value{line_ending}"
+        )
+
+    @pytest.mark.parametrize("ending", ["\n", "\r\n"])
+    def test_preserves_trailing_blank_lines(self, ending):
+        original = "value" + ending
+        new = original + ending
+        assert load_large_diff("test.py", new, original) == (
+            f"@@ -1 +1,2 @@\n value{ending}+{ending}"
+        )
+        assert load_large_diff("test.py", original, new) == (
+            f"@@ -1,2 +1 @@\n value{ending}-{ending}"
+        )
+
+    @pytest.mark.parametrize("content", ["value  \n", "value\t\r\n", "value\n\n", "  "])
+    def test_unchanged_whitespace_has_no_diff(self, content):
+        assert load_large_diff("test.py", content, content) == ""
+
+
+class TestOmittedHunkCount:
+    def test_omitted_count_is_parsed_as_one(self):
+        section_header, size1, size2, start1, start2 = extract_hunk_headers(
+            RE_HUNK_HEADER.match("@@ -1 +1 @@"))
+        assert (start1, size1, start2, size2) == (1, 1, 1, 1)
+
+    def test_omitted_count_on_one_side_only(self):
+        section_header, size1, size2, start1, start2 = extract_hunk_headers(
+            RE_HUNK_HEADER.match("@@ -10,7 +12 @@"))
+        assert (start1, size1, start2, size2) == (10, 7, 12, 1)
+
+    def test_single_line_hunk_does_not_resurrect_the_deleted_line(self):
+        original = "".join(f"l{i}\n" for i in range(1, 9))
+        new = "CHANGED\n" + "".join(f"l{i}\n" for i in range(2, 9))
+        extended = extend_patch(original, "@@ -1 +1 @@\n-l1\n+CHANGED",
+                                patch_extra_lines_before=0, patch_extra_lines_after=3,
+                                filename="m.py", new_file_str=new)
+        assert "\n l1" not in extended
+        for expected in (" l2", " l3", " l4"):
+            assert expected in extended
+
+    def test_hunk_line_range_excludes_the_line_after_the_hunk(self):
+        patch = ("@@ -10,1 +12 @@\n-old\n+only_line\n"
+                 "@@ -20,3 +20,3 @@\n ctx20\n-old21\n+new21\n ctx22")
+        full, _ = extract_hunk_lines_from_patch(patch, "f.py", 13, 13, "right")
+        assert "@@ -10,1 +12 @@" not in full
+
+
+def test_extended_context_stops_at_adjacent_hunks():
+    original = "".join(f"l{i}\n" for i in range(1, 11))
+    patch = "@@ -3 +3 @@\n-l3\n+L3\n@@ -6 +6 @@\n-l6\n+L6"
+
+    extended = extend_patch(original, patch, patch_extra_lines_before=5, patch_extra_lines_after=3)
+
+    assert extended == ("\n@@ -1,5 +1,5 @@ \n l1\n l2\n-l3\n+L3\n l4\n l5\n"
+                        "\n@@ -6,4 +6,4 @@ \n-l6\n+L6\n l7\n l8\n l9")
+
+
+class TestExtendedDiffDeletionHandling:
+    def _deleted_file(self):
+        return FilePatchInfo(base_file="one\ntwo\n", head_file="", patch="@@ -1,2 +0,0 @@\n-one\n-two",
+                             filename="gone.py", edit_type=EDIT_TYPE.DELETED)
+
+    def _mixed_file(self):
+        base = "\n".join(["a", "b", "c", "d", "e", "f", "drop", "g"]) + "\n"
+        head = "\n".join(["a", "B", "c", "d", "e", "f", "g"]) + "\n"
+        patch = "@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n@@ -6,3 +6,2 @@\n f\n-drop\n g"
+        return FilePatchInfo(base_file=base, head_file=head, patch=patch, filename="mixed.py",
+                             edit_type=EDIT_TYPE.MODIFIED)
+
+    def _render(self, deleted_files=None):
+        languages = [{"language": "Python", "files": [self._deleted_file(), self._mixed_file()]}]
+        patches, _, _ = pr_generate_extended_diff(languages, TokenHandler("gpt-4"), add_line_numbers_to_hunks=False,
+                                                  deleted_files=deleted_files)
+        return "\n".join(patches)
+
+    def test_deletions_dropped_and_named_when_requested(self):
+        deleted = []
+        diff = self._render(deleted)
+        assert deleted == ["gone.py"]
+        assert "-one" not in diff and "-drop" not in diff
+        assert "+B" in diff
+
+    def test_deletions_kept_by_default(self):
+        diff = self._render()
+        assert "-one" in diff and "-drop" in diff
+
+    def test_over_budget_diff_collects_deleted_names(self):
+        files = [self._deleted_file()] + [
+            FilePatchInfo(base_file="x\n", head_file="y\n", patch="@@ -1 +1 @@\n-x\n+" + ("y " * 3000),
+                          filename=f"big{index}.py", edit_type=EDIT_TYPE.MODIFIED)
+            for index in range(4)
+        ]
+        provider = type("Provider", (), {"get_diff_files": lambda self: files,
+                                         "get_languages": lambda self: {"Python": len(files)}})()
+        deleted = []
+        chunks = get_pr_multi_diffs(provider, TokenHandler("gpt-4"), "gpt-4", deleted_files=deleted,
+                                    include_filtered_file_names=False)
+        assert len(chunks) > 1
+        assert deleted == ["gone.py"]
+        assert "-one" not in "\n".join(chunks)
+
+
+class TestExtendPatchZeroLengthHunks:
+    """`git diff -U0` numbers the line *before* a pure insertion or deletion."""
+
+    ORIGINAL = 'a\nb\nc\nd\ne\nf\n'
+
+    def test_pure_insertion_extended_both_sides(self):
+        # Use the `git diff -U0` output after inserting X between c and d
+        new_file = 'a\nb\nc\nX\nd\ne\nf\n'
+        actual = extend_patch(self.ORIGINAL, '@@ -3,0 +4 @@\n+X', patch_extra_lines_before=1,
+                              patch_extra_lines_after=1, filename='f.py', new_file_str=new_file)
+        assert actual == '\n@@ -3,2 +3,3 @@ \n c\n+X\n d'
+
+    def test_pure_deletion_extended_both_sides(self):
+        # Use the `git diff -U0` output after deleting c and d
+        new_file = 'a\nb\ne\nf\n'
+        actual = extend_patch(self.ORIGINAL, '@@ -3,2 +2,0 @@\n-c\n-d', patch_extra_lines_before=1,
+                              patch_extra_lines_after=1, filename='f.py', new_file_str=new_file)
+        assert actual == '\n@@ -2,4 +2,2 @@ \n b\n-c\n-d\n e'
+
+    def test_pure_insertion_extended_after_only(self):
+        new_file = 'a\nb\nc\nX\nd\ne\nf\n'
+        actual = extend_patch(self.ORIGINAL, '@@ -3,0 +4 @@\n+X', patch_extra_lines_before=0,
+                              patch_extra_lines_after=2, filename='f.py', new_file_str=new_file)
+        assert actual == '\n@@ -4,2 +4,3 @@ \n+X\n d\n e'
+
+    def test_pure_insertion_at_end_of_file_keeps_header(self):
+        # Keep the header as it was: nothing can be added after the last line
+        new_file = 'a\nb\nc\nd\ne\nf\nX\n'
+        actual = extend_patch(self.ORIGINAL, '@@ -6,0 +7 @@\n+X', patch_extra_lines_before=0,
+                              patch_extra_lines_after=2, filename='f.py', new_file_str=new_file)
+        assert actual == '\n@@ -6,0 +7,1 @@ \n+X'
+>>>>>>> upstream/main
