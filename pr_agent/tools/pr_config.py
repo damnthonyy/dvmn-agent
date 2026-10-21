@@ -15,7 +15,8 @@ class PRConfig:
 
         Args:
             pr_url (str): The URL of the pull request to be reviewed.
-            args (list, optional): List of arguments passed to the PRReviewer class. Defaults to None.
+            args (list, optional): Unused compatibility parameter for the common tool interface. Defaults to None.
+            ai_handler: Unused compatibility parameter for the common tool interface. Defaults to None.
         """
         self.git_provider = get_git_provider()(pr_url)
 
@@ -32,12 +33,15 @@ class PRConfig:
     def _prepare_pr_configs(self) -> str:
         try:
             conf_file = get_settings().find_file("configuration.toml")
-            dynconf_kwargs = {'core_loaders': [],  # DISABLE default loaders, otherwise will load toml files more than once.
-                 'loaders': ['pr_agent.custom_merge_loader'],
-                 # Use a custom loader to merge sections, but overwrite their overlapping values. Do not use ENV variables.
-                 'merge_enabled': True
-                 # Merge multiple TOML files; prevent full section overwrite—only overlapping keys in sections overwrite prior ones.
-             }
+            dynconf_kwargs = {
+                'core_loaders': [],  # DISABLE default loaders, otherwise will load toml files more than once.
+                'loaders': ['pr_agent.custom_merge_loader'],
+                # Use a custom loader to merge sections, but overwrite their overlapping values.
+                # Do not use ENV variables.
+                'merge_enabled': True
+                # Merge multiple TOML files; prevent full section overwrite—only overlapping keys
+                # in sections overwrite prior ones.
+            }
             conf_settings = Dynaconf(settings_files=[conf_file],
                                      # Security: Disable all dynamic loading features
                                      load_dotenv=False,  # Don't load .env files
@@ -51,22 +55,27 @@ class PRConfig:
         configuration_headers = [header.lower() for header in conf_settings.keys()]
         relevant_configs = {
             header: configs for header, configs in get_settings().to_dict().items()
-            if (header.lower().startswith("pr_") or header.lower().startswith("config")) and header.lower() in configuration_headers
+            if (header.lower().startswith("pr_") or header.lower().startswith("config"))
+            and header.lower() in configuration_headers
         }
 
-        skip_keys = ['ai_disclaimer', 'ai_disclaimer_title', 'ANALYTICS_FOLDER', 'secret_provider', "skip_keys", "app_id", "redirect",
-                     'trial_prefix_message', 'no_eligible_message', 'identity_provider', 'ALLOWED_REPOS',
-                     'APP_NAME', 'PERSONAL_ACCESS_TOKEN', 'shared_secret', 'key', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'user_token',
-                     'private_key', 'private_key_id', 'client_id', 'client_secret', 'token', 'bearer_token', 'jira_api_token','webhook_secret']
+        skip_keys = [
+            'ai_disclaimer', 'ai_disclaimer_title', 'ANALYTICS_FOLDER', 'secret_provider',
+            "skip_keys", "app_id", "redirect", 'trial_prefix_message', 'no_eligible_message',
+            'identity_provider', 'ALLOWED_REPOS', 'APP_NAME', 'PERSONAL_ACCESS_TOKEN',
+            'shared_secret', 'key', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'user_token',
+            'private_key', 'private_key_id', 'client_id', 'client_secret', 'token',
+            'bearer_token', 'jira_api_token', 'webhook_secret'
+        ]
         partial_skip_keys = ['key', 'secret', 'token', 'private']
-        extra_skip_keys = get_settings().config.get('config.skip_keys', [])
+        extra_skip_keys = get_settings().config.get("skip_keys", [])
         if extra_skip_keys:
             skip_keys.extend(extra_skip_keys)
         skip_keys_lower = [key.lower() for key in skip_keys]
 
 
         markdown_text = "<details> <summary><strong>🛠️ PR-Agent Configurations:</strong></summary> \n\n"
-        markdown_text += f"\n\n```yaml\n\n"
+        markdown_text += "\n\n```yaml\n\n"
         for header, configs in relevant_configs.items():
             if configs:
                 markdown_text += "\n\n"
@@ -76,9 +85,11 @@ class PRConfig:
                     continue
                 if any(skip_key in key.lower() for skip_key in partial_skip_keys):
                     continue
-                markdown_text += f"\n{header.lower()}.{key.lower()} = {repr(value) if isinstance(value, str) else value}"
+                markdown_text += (
+                    f"\n{header.lower()}.{key.lower()} = {repr(value) if isinstance(value, str) else value}"
+                )
                 markdown_text += "  "
         markdown_text += "\n```"
         markdown_text += "\n</details>\n"
-        get_logger().info(f"Possible Configurations outputted to PR comment", artifact=markdown_text)
+        get_logger().info("Possible Configurations outputted to PR comment", artifact=markdown_text)
         return markdown_text
