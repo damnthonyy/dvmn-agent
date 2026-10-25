@@ -1,0 +1,772 @@
+"""
+Security-focused tests for pr_agent.git_providers.utils.apply_repo_settings.
+
+These tests verify:
+- The repo settings fetch path is skipped when use_repo_settings_file is disabled.
+- Valid repo TOML overrides only the specified keys and preserves siblings.
+- Invalid TOML produces exactly one local-category configuration error and
+  does not pollute global settings.
+- Forbidden directives (e.g. dynaconf_include) are rejected and produce a
+  local-category configuration error without polluting settings.
+- The temporary file created from the repo settings bytes is removed after
+  apply_repo_settings, both on success and on failure.
+"""
+
+import copy
+import os
+import tempfile
+from contextlib import suppress
+
+import pytest
+
+from pr_agent.algo.cli_args import CliArgs
+from pr_agent.config_loader import get_settings
+from pr_agent.config_security import is_repo_host_only_key
+from pr_agent.git_providers import utils as git_utils
+from pr_agent.git_providers.utils import apply_repo_settings
+
+
+class FakeGitProvider:
+    """Minimal fake provider exposing the methods apply_repo_settings touches."""
+
+    def __init__(self, repo_settings_bytes=b""):
+        self._repo_settings = repo_settings_bytes
+        self.persistent_comments = []
+        self.comments = []
+        self.get_repo_settings_calls = 0
+
+    def get_repo_settings(self):
+        self.get_repo_settings_calls += 1
+        return self._repo_settings
+
+    def is_supported(self, capability):
+        return capability == "gfm_markdown"
+
+    def publish_persistent_comment(self, body, initial_header, update_header, final_update_message):
+        self.persistent_comments.append(
+            {
+                "body": body,
+                "initial_header": initial_header,
+                "update_header": update_header,
+                "final_update_message": final_update_message,
+            }
+        )
+
+    def publish_comment(self, body):
+        self.comments.append(body)
+
+
+SNAPSHOT_SECTIONS = (
+    "CONFIG",
+    "PR_REVIEWER",
+    "PROMPT_FRAGMENTS",
+    "CUSTOM_SECTION_FOR_TEST",
+    "OPENAI",
+    "AZURE_AD",
+    "HUGGINGFACE",
+    "OLLAMA",
+    "MOONSHOT",
+    "DATABRICKS",
+    "OPENROUTER",
+    "LITELLM",
+    "GITHUB",
+    "BITBUCKET",
+    "GITLAB",
+    "GITEA",
+    "GERRIT",
+    "JIRA",
+    "LINEAR",
+    "LANGUAGE_EXTENSION_MAP_ORG",
+)
+
+
+def _snapshot_settings_sections(settings):
+    return {section: copy.deepcopy(settings.as_dict().get(section)) for section in SNAPSHOT_SECTIONS}
+
+
+def _restore_settings_sections(settings, snapshot):
+    for section, data in snapshot.items():
+        # ``unset`` raises ``KeyError`` if the section was never set during
+        # the test; that's expected and safe to ignore. Anything else (e.g.
+        # a Dynaconf internal error) should propagate so a broken teardown
+        # surfaces instead of silently leaking state into other tests.
+        with suppress(KeyError):
+            settings.unset(section, force=True)
+        if data is not None:
+            settings.set(section, copy.deepcopy(data), merge=False)
+
+
+_ENV_ABSENT = object()
+
+
+@pytest.fixture
+def settings_snapshot():
+    """Snapshot the keys mutated by these tests and restore them afterwards.
+
+    Also snapshots the ``AUTO_CAST_FOR_DYNACONF`` environment variable, which
+    ``apply_repo_settings`` unconditionally sets to ``"false"``. Using a
+    sentinel for "originally absent" ensures the env restore is exact:
+    keys that were absent are deleted, never left as a stray ``None``-like
+    string that could leak into other tests.
+    """
+    settings = get_settings()
+    snapshot = _snapshot_settings_sections(settings)
+    env_before = os.environ.get("AUTO_CAST_FOR_DYNACONF", _ENV_ABSENT)
+    try:
+        yield
+    finally:
+        _restore_settings_sections(settings, snapshot)
+        if env_before is _ENV_ABSENT:
+            os.environ.pop("AUTO_CAST_FOR_DYNACONF", None)
+        else:
+            os.environ["AUTO_CAST_FOR_DYNACONF"] = env_before
+
+
+def _install_provider(monkeypatch, provider):
+    captured = {"errors": None, "git_provider": None}
+
+    def fake_get_git_provider_with_context(pr_url):
+        return provider
+
+    def fake_handle_configurations_errors(errors, git_provider):
+        captured["errors"] = errors
+        captured["git_provider"] = git_provider
+
+    monkeypatch.setattr(git_utils, "get_git_provider_with_context", fake_get_git_provider_with_context)
+    monkeypatch.setattr(git_utils, "handle_configurations_errors", fake_handle_configurations_errors)
+    return captured
+
+
+def test_disabled_repo_settings_skips_provider_fetch(monkeypatch, settings_snapshot):
+    provider = FakeGitProvider(repo_settings_bytes=b"[pr_reviewer]\nnum_max_findings = 99\n")
+    captured = _install_provider(monkeypatch, provider)
+
+    get_settings().set("config.use_repo_settings_file", False)
+    original_num = get_settings().as_dict().get("PR_REVIEWER", {}).get("num_max_findings")
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert provider.get_repo_settings_calls == 0
+    assert captured["errors"] is None
+    # Settings were not touched.
+    assert get_settings().as_dict().get("PR_REVIEWER", {}).get("num_max_findings") == original_num
+
+
+def _section(settings, name):
+    """Return a section dict from settings using a case-insensitive lookup."""
+    data = settings.as_dict()
+    upper = name.upper()
+    for key, value in data.items():
+        if key.upper() == upper:
+            return value if isinstance(value, dict) else {}
+    return {}
+
+
+def test_valid_repo_settings_merge_overrides_key_and_preserves_siblings(monkeypatch, settings_snapshot):
+    provider = FakeGitProvider(repo_settings_bytes=b"[pr_reviewer]\nnum_max_findings = 11\n")
+    captured = _install_provider(monkeypatch, provider)
+
+    get_settings().set("config.use_repo_settings_file", True)
+    settings = get_settings()
+    sibling_before = _section(settings, "pr_reviewer").get("require_tests_review")
+    assert sibling_before is not None, "Test precondition: sibling key should already be present"
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert provider.get_repo_settings_calls == 1
+    assert captured["errors"] is None, f"Unexpected configuration errors: {captured['errors']}"
+
+    pr_reviewer = _section(settings, "pr_reviewer")
+    assert pr_reviewer.get("num_max_findings") == 11
+    # Unrelated sibling key in the same section must be preserved by the merge logic.
+    assert pr_reviewer.get("require_tests_review") == sibling_before
+
+
+def test_repo_settings_cannot_enable_publish_error_details(monkeypatch, settings_snapshot):
+    provider = FakeGitProvider(
+        repo_settings_bytes=b"[pr_reviewer]\npublish_error_details = true\nnum_max_findings = 11\n"
+    )
+    _install_provider(monkeypatch, provider)
+
+    get_settings().set("config.use_repo_settings_file", True)
+    settings = get_settings()
+    publish_error_details_before = _section(settings, "pr_reviewer").get("publish_error_details")
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    pr_reviewer = _section(settings, "pr_reviewer")
+    assert pr_reviewer.get("publish_error_details") == publish_error_details_before
+    assert pr_reviewer.get("num_max_findings") == 11
+
+
+def test_repo_settings_cannot_override_prompt_fragments(monkeypatch, settings_snapshot):
+    provider = FakeGitProvider(repo_settings_bytes=b'[prompt_fragments]\ndiff_hunk_format = "UNTRUSTED-FRAGMENT"\n')
+    captured = _install_provider(monkeypatch, provider)
+
+    get_settings().set("config.use_repo_settings_file", True)
+    settings = get_settings()
+    fragment_before = _section(settings, "prompt_fragments").get("diff_hunk_format")
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert captured["errors"] is None
+    assert _section(settings, "prompt_fragments").get("diff_hunk_format") == fragment_before
+
+
+def test_repo_settings_cannot_override_extra_config_url(monkeypatch, settings_snapshot):
+    provider = FakeGitProvider(
+        repo_settings_bytes=b'[config]\nextra_config_url = "https://evil.example.com/evil.toml"\n'
+    )
+    captured = _install_provider(monkeypatch, provider)
+
+    get_settings().set("config.use_repo_settings_file", True)
+    get_settings().set("config.extra_config_url", "")
+    settings = get_settings()
+    extra_before = _section(settings, "config").get("extra_config_url")
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert captured["errors"] is None
+    assert _section(settings, "config").get("extra_config_url") == extra_before
+
+
+def test_invalid_toml_does_not_pollute_settings(monkeypatch, settings_snapshot):
+    """
+    Malformed TOML must never leak into the live settings. The custom loader
+    currently swallows the TOMLDecodeError and logs it, so no local error is
+    propagated to handle_configurations_errors; the surviving security
+    guarantee is that the existing settings are untouched.
+    """
+    malformed = b"[pr_reviewer\nnum_max_findings = 7\n"
+    provider = FakeGitProvider(repo_settings_bytes=malformed)
+    _install_provider(monkeypatch, provider)
+
+    get_settings().set("config.use_repo_settings_file", True)
+    settings = get_settings()
+    before = copy.deepcopy(_section(settings, "pr_reviewer"))
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    after = _section(settings, "pr_reviewer")
+    assert after == before
+    # Whatever errors may or may not be published, the malformed payload must
+    # never be merged silently into pr_reviewer.
+    assert after.get("num_max_findings") != 7
+
+
+def test_invalid_toml_publishes_one_local_error(monkeypatch, settings_snapshot):
+    malformed = b"[pr_reviewer\nnum_max_findings = 7\n"
+    provider = FakeGitProvider(repo_settings_bytes=malformed)
+    captured = _install_provider(monkeypatch, provider)
+    get_settings().set("config.use_repo_settings_file", True)
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert captured["errors"] is not None
+    assert len(captured["errors"]) == 1
+    assert captured["errors"][0]["category"] == "local"
+    assert captured["errors"][0]["settings"] == malformed
+
+
+def test_forbidden_directive_does_not_pollute_settings(monkeypatch, settings_snapshot):
+    """
+    A repo TOML containing forbidden directives (e.g. dynaconf_include) must
+    not leak into the live settings. As with malformed TOML, the loader's
+    SecurityError is currently swallowed silently; the security guarantee
+    checked here is that no part of the payload (including the legitimate
+    pr_reviewer override) reaches the settings.
+    """
+    forbidden_toml = b"dynaconf_include = ['evil.toml']\n[pr_reviewer]\nnum_max_findings = 42\n"
+    provider = FakeGitProvider(repo_settings_bytes=forbidden_toml)
+    _install_provider(monkeypatch, provider)
+
+    get_settings().set("config.use_repo_settings_file", True)
+    settings = get_settings()
+    before = copy.deepcopy(_section(settings, "pr_reviewer"))
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    after = _section(settings, "pr_reviewer")
+    # The forbidden file must be rejected wholesale; neither the directive
+    # nor the piggy-backed pr_reviewer override should be applied.
+    assert after == before
+    assert after.get("num_max_findings") != 42
+    assert "dynaconf_include" not in {k.lower() for k in settings.as_dict().keys()}
+
+
+def test_forbidden_directive_publishes_one_local_error(monkeypatch, settings_snapshot):
+    forbidden_toml = b"dynaconf_include = ['evil.toml']\n[pr_reviewer]\nnum_max_findings = 42\n"
+    provider = FakeGitProvider(repo_settings_bytes=forbidden_toml)
+    captured = _install_provider(monkeypatch, provider)
+    get_settings().set("config.use_repo_settings_file", True)
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert captured["errors"] is not None
+    assert len(captured["errors"]) == 1
+    assert captured["errors"][0]["category"] == "local"
+    assert captured["errors"][0]["settings"] == forbidden_toml
+    # The error message must not leak the server's internal temp path to PR users.
+    import tempfile
+
+    error_text = captured["errors"][0]["error"]
+    assert tempfile.gettempdir() not in error_text
+    assert ".pr_agent.toml" in error_text
+
+
+def test_temp_file_is_removed_after_successful_apply(monkeypatch, tmp_path, settings_snapshot):
+    provider = FakeGitProvider(repo_settings_bytes=b"[pr_reviewer]\nnum_max_findings = 5\n")
+    _install_provider(monkeypatch, provider)
+    get_settings().set("config.use_repo_settings_file", True)
+
+    known_path = tmp_path / "repo_settings_success.toml"
+
+    def fake_mkstemp(suffix=None, prefix=None, dir=None, text=False):
+        fd = os.open(str(known_path), os.O_RDWR | os.O_CREAT | os.O_TRUNC)
+        return fd, str(known_path)
+
+    monkeypatch.setattr(tempfile, "mkstemp", fake_mkstemp)
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert not known_path.exists(), "Temp settings file must be removed after successful apply"
+
+
+def test_temp_file_is_removed_after_failed_apply(monkeypatch, tmp_path, settings_snapshot):
+    """The temp file must be removed even when the Dynaconf load step raises.
+
+    We use *valid* TOML bytes (so the failure cannot be confused with the
+    silent-swallow malformed-TOML path) and force the failure by replacing
+    the ``Dynaconf`` symbol bound inside ``pr_agent.git_providers.utils``
+    with a stub that raises *after* ``mkstemp`` has been called. We do not
+    patch the external ``dynaconf`` module — only the imported reference
+    that ``apply_repo_settings`` actually uses.
+    """
+    valid_toml = b"[pr_reviewer]\nnum_max_findings = 3\n"
+    provider = FakeGitProvider(repo_settings_bytes=valid_toml)
+    captured = _install_provider(monkeypatch, provider)
+    get_settings().set("config.use_repo_settings_file", True)
+
+    known_path = tmp_path / "repo_settings_failure.toml"
+    mkstemp_calls = {"n": 0}
+
+    def fake_mkstemp(suffix=None, prefix=None, dir=None, text=False):
+        mkstemp_calls["n"] += 1
+        fd = os.open(str(known_path), os.O_RDWR | os.O_CREAT | os.O_TRUNC)
+        return fd, str(known_path)
+
+    monkeypatch.setattr(tempfile, "mkstemp", fake_mkstemp)
+
+    def exploding_validate(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    # Force a failure during apply (validate_file_security runs after mkstemp/parse).
+    monkeypatch.setattr(git_utils, "validate_file_security", exploding_validate)
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert mkstemp_calls["n"] == 1, "mkstemp must have run before the failure"
+    assert not known_path.exists(), "Temp settings file must be removed even after a failed apply"
+
+    # The local-category configuration error path must have been exercised.
+    assert captured["errors"] is not None, "handle_configurations_errors should have been called"
+    assert len(captured["errors"]) == 1
+    err = captured["errors"][0]
+    assert err["category"] == "local"
+    assert err["settings"] == valid_toml
+    assert "boom" in err["error"]
+
+
+def test_restore_settings_sections_removes_section_created_after_snapshot():
+    settings = get_settings()
+    original_snapshot = _snapshot_settings_sections(settings)
+
+    try:
+        settings.unset("CUSTOM_SECTION_FOR_TEST", force=True)
+        assert "CUSTOM_SECTION_FOR_TEST" not in settings.as_dict()
+
+        snapshot = _snapshot_settings_sections(settings)
+        assert snapshot["CUSTOM_SECTION_FOR_TEST"] is None
+
+        settings.set("CUSTOM_SECTION_FOR_TEST", {"foo": "bar"}, merge=False)
+        assert settings.as_dict()["CUSTOM_SECTION_FOR_TEST"] == {"foo": "bar"}
+
+        _restore_settings_sections(settings, snapshot)
+
+        assert "CUSTOM_SECTION_FOR_TEST" not in settings.as_dict()
+    finally:
+        _restore_settings_sections(settings, original_snapshot)
+
+
+@pytest.mark.parametrize(
+    ("section", "key"),
+    [
+        ("openai", "api_base"),
+        ("openai", "api_type"),
+        ("openai", "api_version"),
+        ("azure_ad", "api_base"),
+        ("huggingface", "api_base"),
+        ("ollama", "api_base"),
+        ("moonshot", "api_base"),
+        ("databricks", "api_base"),
+        ("openrouter", "api_base"),
+        ("linear", "api_token"),
+    ],
+)
+def test_repo_settings_cannot_override_provider_endpoint_keys(monkeypatch, settings_snapshot, section, key):
+    repo_settings = f'[{section}]\n{key} = "repo-controlled"\n'.encode()
+    provider = FakeGitProvider(repo_settings_bytes=repo_settings)
+    captured = _install_provider(monkeypatch, provider)
+
+    settings = get_settings()
+    settings.set("config.use_repo_settings_file", True)
+    settings.set(f"{section}.{key}", "host-controlled")
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert captured["errors"] is None
+    assert _section(settings, section).get(key) == "host-controlled"
+
+
+def test_repo_settings_filter_provider_credentials_but_apply_safe_keys(monkeypatch, settings_snapshot):
+    provider = FakeGitProvider(
+        repo_settings_bytes=(b'[ollama]\napi_key = "repo-key"\ntimeout = 30\n')
+    )
+    _install_provider(monkeypatch, provider)
+
+    settings = get_settings()
+    settings.set("config.use_repo_settings_file", True)
+    settings.set("ollama.api_key", "host-key")
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    ollama = _section(settings, "ollama")
+    assert ollama.get("api_key") == "host-key"
+    assert ollama.get("timeout") == 30
+
+
+@pytest.mark.parametrize(
+    ("section", "key"),
+    [
+        ("github", "base_url"),
+        ("gerrit", "patch_server_endpoint"),
+        ("gerrit", "webhook_password"),
+        ("gerrit", "webhook_username"),
+        ("azure_devops", "org"),
+        ("azure_devops", "pat"),
+        ("aws", "aws_access_key_id"),
+        ("aws", "aws_region_name"),
+        ("anthropic", "key"),
+        ("gitlab", "private_token"),
+        ("linear", "api_token"),
+    ],
+)
+def test_provider_connection_keys_are_host_only_for_repo_and_cli(section, key):
+    assert is_repo_host_only_key(section, key)
+    assert CliArgs.validate_user_args([f"--{section}.{key}=untrusted"])[0] is False
+
+
+@pytest.mark.parametrize("repo_settings_bytes", [
+    b"[gerrit]\ncommand_timeout_seconds = 999\n",
+    b"[gerrit.command_timeout_seconds]\nx = 999\n",
+    b"[gerrit__command_timeout_seconds]\nx = 999\n",
+])
+def test_repo_settings_cannot_override_gerrit_command_timeout(
+    monkeypatch, settings_snapshot, repo_settings_bytes
+):
+    provider = FakeGitProvider(repo_settings_bytes=repo_settings_bytes)
+    _install_provider(monkeypatch, provider)
+    settings = get_settings()
+    settings.set("config.use_repo_settings_file", True)
+    settings.set("gerrit.command_timeout_seconds", 21)
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert _section(settings, "gerrit")["command_timeout_seconds"] == 21
+    assert is_repo_host_only_key("gerrit", "command_timeout_seconds")
+
+
+def test_polling_repositories_is_host_only_for_repo_and_cli():
+    assert is_repo_host_only_key("github", "polling_repositories")
+    assert CliArgs.validate_user_args(["--github.polling_repositories=attacker/repo"])[0] is False
+
+
+@pytest.mark.parametrize(
+    ("section", "key"),
+    [
+        ("github", "deployment_type"),
+        ("bitbucket", "auth_type"),
+        ("gitlab", "auth_type"),
+        ("gitlab", "ssl_verify"),
+        ("gitea", "skip_ssl_verification"),
+        ("gitea", "ssl_ca_cert"),
+    ],
+)
+def test_repo_settings_cannot_override_provider_authentication_or_tls(
+    monkeypatch, settings_snapshot, section, key
+):
+    provider = FakeGitProvider(repo_settings_bytes=f'[{section}]\n{key} = "repo-controlled"\n'.encode())
+    _install_provider(monkeypatch, provider)
+
+    settings = get_settings()
+    settings.set("config.use_repo_settings_file", True)
+    settings.set(f"{section}.{key}", "host-controlled")
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert _section(settings, section).get(key) == "host-controlled"
+    assert CliArgs.validate_user_args([f"--{section}.{key}=untrusted"])[0] is False
+
+
+@pytest.mark.parametrize(
+    ("key", "host_value", "repo_toml_value"),
+    [
+        ("project_keys", ["PROJ"], '["PROJ", "HR"]'),
+        ("cloud_id", "35273b54-3f06-40d2-880f-dd28cf8daafa", '"00000000-0000-0000-0000-000000000000"'),
+        ("jira_site", "host-org", '"other-org"'),
+        ("jira_api_email", "bot@host.example", '"other@repo.example"'),
+    ],
+)
+def test_repo_settings_cannot_widen_jira_lookup_scope(
+    monkeypatch, settings_snapshot, key, host_value, repo_toml_value
+):
+    # Jira lookups run with the host's Atlassian credentials, so the repository under
+    # review must not choose which projects or which site those credentials read.
+    provider = FakeGitProvider(repo_settings_bytes=f"[jira]\n{key} = {repo_toml_value}\n".encode())
+    _install_provider(monkeypatch, provider)
+
+    settings = get_settings()
+    settings.set("config.use_repo_settings_file", True)
+    settings.set(f"jira.{key}", host_value)
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    jira_section = {k.lower(): v for k, v in _section(settings, "jira").items()}
+    assert jira_section.get(key.lower()) == host_value
+    assert CliArgs.validate_user_args([f"--jira.{key}=untrusted"])[0] is False
+
+
+def test_repo_settings_filter_jira_scope_but_apply_requirements_field(monkeypatch, settings_snapshot):
+    provider = FakeGitProvider(repo_settings_bytes=b"""
+[jira]
+project_keys = ["HR"]
+jira_requirements_field = "customfield_10127"
+""")
+    _install_provider(monkeypatch, provider)
+
+    settings = get_settings()
+    settings.set("config.use_repo_settings_file", True)
+    settings.set("jira.project_keys", ["PROJ"])
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    jira = _section(settings, "jira")
+    assert jira.get("project_keys") == ["PROJ"]
+    assert jira.get("jira_requirements_field") == "customfield_10127"
+    assert CliArgs.validate_user_args(["--jira.jira_requirements_field=customfield_1"])[0] is True
+    assert CliArgs.validate_user_args(['--jira={project_keys: ["HR"]}'])[0] is False
+
+
+def test_litellm_extra_headers_is_host_only_key():
+    assert is_repo_host_only_key("litellm", "extra_headers")
+    assert is_repo_host_only_key("LITELLM", "EXTRA_HEADERS")
+
+
+def test_comment_args_cannot_set_litellm_extra_headers():
+    assert CliArgs.validate_user_args(['--litellm.extra_headers={"X-Tenant":"attacker"}'])[0] is False
+
+
+def test_repo_settings_cannot_override_litellm_extra_headers(monkeypatch, settings_snapshot):
+    # The headers ride on every model request, so on a shared gateway the reviewed repository
+    # must not choose them.
+    provider = FakeGitProvider(repo_settings_bytes=b"""
+[litellm]
+extra_headers = '{"X-Tenant":"attacker"}'
+""")
+    _install_provider(monkeypatch, provider)
+
+    settings = get_settings()
+    settings.set("config.use_repo_settings_file", True)
+    settings.set("litellm.extra_headers", '{"X-Tenant":"operator"}')
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    litellm_section = {k.lower(): v for k, v in _section(settings, "litellm").items()}
+    assert litellm_section.get("extra_headers") == '{"X-Tenant":"operator"}'
+
+
+def test_repo_settings_still_apply_other_litellm_keys(monkeypatch, settings_snapshot):
+    provider = FakeGitProvider(repo_settings_bytes=b"[litellm]\ndrop_params = true\n")
+    captured = _install_provider(monkeypatch, provider)
+
+    settings = get_settings()
+    settings.set("config.use_repo_settings_file", True)
+    settings.set("litellm.drop_params", False)
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert captured["errors"] is None
+    litellm_section = {k.lower(): v for k, v in _section(settings, "litellm").items()}
+    assert litellm_section.get("drop_params") is True
+    assert not is_repo_host_only_key("litellm", "drop_params")
+    assert CliArgs.validate_user_args(["--litellm.drop_params=true"])[0] is True
+
+
+@pytest.mark.parametrize(
+    "arg",
+    ["--gerrit.connection.secret=untrusted", '--qdrant={replicas: [{base_url: "https://evil.example"}]}'],
+)
+def test_nested_provider_connection_keys_are_host_only_for_cli(arg):
+    assert CliArgs.validate_user_args([arg])[0] is False
+
+
+def test_progress_gif_url_remains_repo_and_cli_configurable():
+    assert not is_repo_host_only_key("config", "progress_gif_url")
+    assert CliArgs.validate_user_args(["--config.progress_gif_url=https://example.com/progress.gif"])[0] is True
+
+
+def test_repo_settings_apply_section_specific_safe_suffix_keys(monkeypatch, settings_snapshot):
+    provider = FakeGitProvider(repo_settings_bytes=b"""
+[gitea]
+url = "https://repo-api.example"
+web_url = "https://repo-public.example"
+[language_extension_map_org]
+AutoHotkey = [".repo-ahk"]
+Monkey = [".repo-monkey"]
+Org = [".repo-org"]
+[custom_labels."API key"]
+description = "Touches API-key handling"
+[custom_labels.Hotkey]
+description = "Keyboard shortcut"
+""")
+    _install_provider(monkeypatch, provider)
+    settings = get_settings()
+    settings.set("config.use_repo_settings_file", True)
+    settings.set("gitea.url", "https://host-api.example")
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert _section(settings, "gitea").get("url") == "https://host-api.example"
+    assert _section(settings, "gitea").get("web_url") == "https://repo-public.example"
+    language_map = _section(settings, "language_extension_map_org")
+    assert {key: language_map.get(key) for key in ("AutoHotkey", "Monkey", "Org")} == {
+        "AutoHotkey": [".repo-ahk"], "Monkey": [".repo-monkey"], "Org": [".repo-org"]
+    }
+    assert set(_section(settings, "custom_labels")) >= {"API key", "Hotkey"}
+    assert CliArgs.validate_user_args(["--gitea.web_url=https://comment.example"])[0] is False
+
+
+def test_repo_settings_reject_dunder_section_name(monkeypatch, settings_snapshot):
+    """A section name containing `__` must be skipped entirely: Dynaconf would
+    otherwise treat it as a nesting separator and merge the contents into the
+    protected section without passing the allowlist/host-only checks."""
+    provider = FakeGitProvider(
+        repo_settings_bytes=b'[config__extra_config_url]\nx = "https://evil.example.com/evil.toml"\n'
+    )
+    captured = _install_provider(monkeypatch, provider)
+
+    settings = get_settings()
+    settings.set("config.use_repo_settings_file", True)
+    settings.set("config.extra_config_url", "")
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert captured["errors"] is None
+    config = _section(settings, "config")
+    # The protected key is untouched and the hostile section did not land
+    # nested inside CONFIG either.
+    assert config.get("extra_config_url") == ""
+
+
+def test_repo_settings_reject_dunder_section_targeting_host_only_key(monkeypatch, settings_snapshot):
+    provider = FakeGitProvider(
+        repo_settings_bytes=b'[pr_reviewer__publish_error_details]\nx = true\n'
+    )
+    _install_provider(monkeypatch, provider)
+
+    settings = get_settings()
+    settings.set("config.use_repo_settings_file", True)
+
+    publish_before = _section(settings, "pr_reviewer").get("publish_error_details")
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    pr_reviewer = _section(settings, "pr_reviewer")
+    # The hostile section is skipped wholesale: the protected key is untouched
+    # and no nested landing of the attack payload exists in PR_REVIEWER.
+    assert pr_reviewer.get("publish_error_details") == publish_before
+    assert not any("__" in key for key in pr_reviewer)
+
+
+def test_repo_settings_reject_dunder_section_for_allowlisted_section(monkeypatch, settings_snapshot):
+    provider = FakeGitProvider(
+        repo_settings_bytes=b'[skills__paths]\nx = "/etc/passwd"\n'
+    )
+    captured = _install_provider(monkeypatch, provider)
+
+    settings = get_settings()
+    settings.set("config.use_repo_settings_file", True)
+    skills_before = copy.deepcopy(_section(settings, "skills"))
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert captured["errors"] is None
+    # The whole hostile section is skipped: no nested landing in SKILLS.
+    assert _section(settings, "skills") == skills_before
+
+
+def test_repo_settings_reject_dunder_keys_inside_section(monkeypatch, settings_snapshot):
+    provider = FakeGitProvider(
+        repo_settings_bytes=(
+            b'[pr_reviewer]\nnum_max_findings = 11\nnum__max__findings = 99\n'
+        )
+    )
+    captured = _install_provider(monkeypatch, provider)
+
+    settings = get_settings()
+    settings.set("config.use_repo_settings_file", True)
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert captured["errors"] is None
+    pr_reviewer = _section(settings, "pr_reviewer")
+    assert pr_reviewer.get("num_max_findings") == 11
+    assert not any("__" in key for key in pr_reviewer)
+
+
+def test_repo_settings_reject_dotted_section_name(monkeypatch, settings_snapshot):
+    """A quoted dotted section name (["config.extra_config_url"]) stays literal
+    after TOML parsing; it must be skipped entirely so it cannot nest into the
+    protected section without passing the allowlist/host-only checks."""
+    provider = FakeGitProvider(
+        repo_settings_bytes=b'["config.extra_config_url"]\nx = "https://evil.example.com/evil.toml"\n'
+    )
+    captured = _install_provider(monkeypatch, provider)
+
+    settings = get_settings()
+    settings.set("config.use_repo_settings_file", True)
+    settings.set("config.extra_config_url", "")
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert captured["errors"] is None
+    config = _section(settings, "config")
+    assert config.get("extra_config_url") == ""
+
+
+@pytest.mark.parametrize("category", ["global", "group", "local"])
+@pytest.mark.parametrize("host_enabled", [False, True])
+def test_repo_settings_cannot_override_group_settings_opt_in(monkeypatch, settings_snapshot, category, host_enabled):
+    untrusted_value = "false" if host_enabled else "true"
+    contents = f"[config]\nuse_group_settings_file = {untrusted_value}\n[pr_reviewer]\nnum_max_findings = 11\n"
+    provider = FakeGitProvider(repo_settings_bytes=[(category, contents.encode())])
+    captured = _install_provider(monkeypatch, provider)
+    settings = get_settings()
+    settings.set("config.use_repo_settings_file", True)
+    settings.set("config.use_group_settings_file", host_enabled)
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert captured["errors"] is None
+    assert settings.config.use_group_settings_file is host_enabled
+    assert settings.pr_reviewer.num_max_findings == 11
