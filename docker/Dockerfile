@@ -1,51 +1,112 @@
-FROM python:3.12.10-slim AS base
+FROM python:3.14.9-slim@sha256:b347e2dcbc7f0b6f9fb7182e9da6a187fb10ae715e0692518c1aed0eec94a700 AS base
+COPY --from=ghcr.io/astral-sh/uv:0.13.5@sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff /uv /uvx /bin/
 
-RUN apt update && apt install --no-install-recommends -y git curl && apt-get clean && rm -rf /var/lib/apt/lists/*
+# litellm fetches its model cost map over the network at import time, so a
+# third-party change to that map can change runtime behavior with no image
+# change and no version bump. Use the map bundled with the litellm pinned in
+# uv.lock so every stage (test and runtime) behaves how it was built and tested
+# rather than tracking today's remote data; new models then arrive with a
+# deliberate litellm bump in the lockfile.
+ENV LITELLM_LOCAL_MODEL_COST_MAP=True
+
+RUN apt-get update && apt-get install --no-install-recommends -y git curl && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-ADD pyproject.toml .
-ADD requirements.txt .
-ADD docs docs
-RUN pip install --no-cache-dir . && rm pyproject.toml requirements.txt
+ENV UV_COMPILE_BYTECODE=1
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-install-project --no-dev --extra all
+# Keep documentation changes from invalidating the dependency layer.
+COPY docs docs
+ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONPATH=/app
 
+<<<<<<< HEAD
 FROM base AS github_app
 ADD pr_agent pr_agent
 ADD public public
+=======
+# Use a dedicated identity for long-running services; preserve the runner, CLI
+# and test mount/install contracts. Grant UID/GID 10001 read access to mounted
+# secrets and write access to custom output, analytics and database paths.
+FROM base AS service
+RUN groupadd --gid 10001 pragent && \
+    useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin pragent && \
+    mkdir -p /app/pr-agent-outputs /app/lancedb && \
+    chown pragent:pragent /app/pr-agent-outputs /app/lancedb
+ENV HOME=/home/pragent
+USER 10001:10001
+
+FROM service AS github_app
+COPY pr_agent pr_agent
+>>>>>>> upstream/main
 CMD ["python", "-m", "gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-c", "pr_agent/servers/gunicorn_config.py", "--forwarded-allow-ips", "*", "pr_agent.servers.github_app:app"]
 
-FROM base AS bitbucket_app
-ADD pr_agent pr_agent
+FROM service AS bitbucket_app
+COPY pr_agent pr_agent
 CMD ["python", "pr_agent/servers/bitbucket_app.py"]
 
-FROM base AS bitbucket_server_webhook
-ADD pr_agent pr_agent
-CMD ["python", "pr_agent/servers/bitbucket_server_webhook.py"]
+FROM service AS bitbucket_server_webhook
+COPY pr_agent pr_agent
+CMD ["python", "-m", "gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-c", "pr_agent/servers/gunicorn_config.py", "--forwarded-allow-ips", "*", "pr_agent.servers.bitbucket_server_webhook:app"]
 
-FROM base AS github_polling
-ADD pr_agent pr_agent
+FROM service AS github_polling
+COPY pr_agent pr_agent
 CMD ["python", "pr_agent/servers/github_polling.py"]
 
-FROM base AS gitlab_webhook
-ADD pr_agent pr_agent
-CMD ["python", "pr_agent/servers/gitlab_webhook.py"]
+FROM base AS github_action
+COPY pr_agent pr_agent
+COPY github_action/entrypoint.sh /
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
 
-FROM base AS azure_devops_webhook
-ADD pr_agent pr_agent
+FROM service AS gitlab_webhook
+COPY pr_agent pr_agent
+CMD ["python", "-m", "gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-c", "pr_agent/servers/gunicorn_config.py", "--forwarded-allow-ips", "*", "pr_agent.servers.gitlab_webhook:app"]
+
+FROM service AS azure_devops_webhook
+COPY pr_agent pr_agent
 CMD ["python", "pr_agent/servers/azuredevops_server_webhook.py"]
 
-FROM base AS gitea_app
-ADD pr_agent pr_agent
+FROM service AS gitea_app
+COPY pr_agent pr_agent
 CMD ["python", "-m", "gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-c", "pr_agent/servers/gunicorn_config.py","pr_agent.servers.gitea_app:app"]
+
+FROM service AS mosaico_agent
+COPY pr_agent pr_agent
+EXPOSE 9000
+CMD ["python", "pr_agent/mosaico/server.py"]
 
 
 FROM base AS test
+<<<<<<< HEAD
 ADD requirements-dev.txt .
 RUN pip install --no-cache-dir -r requirements-dev.txt && rm requirements-dev.txt
 ADD pr_agent pr_agent
 ADD public public
 ADD tests tests
+=======
+# The base stage pins LITELLM_LOCAL_MODEL_COST_MAP for every stage; kept here
+# only as documentation that the unit suite keys off the bundled cost map.
+RUN uv sync --frozen --no-install-project --extra all
+COPY pr_agent pr_agent
+COPY tests tests
+# Config the unit suite asserts against, copied file by file so an unrelated
+# workflow edit does not invalidate this layer.
+COPY .github/workflows/publish.yml .github/workflows/publish.yml
+COPY .github/workflows/build-and-test.yaml .github/workflows/build-and-test.yaml
+COPY docker/Dockerfile docker/Dockerfile
+COPY docker/Dockerfile.lambda docker/Dockerfile.lambda
+COPY docker/mosaico docker/mosaico
+# Read by the docs guards: the URL checker, the pages that link into the docs site,
+# and the packaging inputs that must ship every /help page suffix. Kept last so a
+# README edit only rebuilds these final layers.
+COPY scripts/check_docs_urls.py scripts/check_docs_urls.py
+COPY scripts/generate_config_reference.py scripts/generate_config_reference.py
+COPY README.md CONTRIBUTING.md SECURITY.md .dockerignore ./
+COPY MANIFEST.in setup.py ./
+>>>>>>> upstream/main
 
 FROM base AS cli
-ADD pr_agent pr_agent
+COPY pr_agent pr_agent
+RUN uv sync --frozen --no-dev --extra all && ln -s /app/.venv/bin/pr-agent /usr/local/bin/pr-agent
 ENTRYPOINT ["python", "pr_agent/cli.py"]

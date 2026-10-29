@@ -11,7 +11,11 @@
 # class TestTicketCompliance(unittest.TestCase):
 #
 #     @patch.object(GithubProvider, 'get_user_description', return_value="Fixes #1 and relates to #2")
-#     @patch.object(GithubProvider, '_parse_issue_url', side_effect=lambda url: ("WonOfAKind/KimchiBot", int(url.split('#')[-1])))
+#     @patch.object(
+#         GithubProvider,
+#         "_parse_issue_url",
+#         side_effect=lambda url: ("WonOfAKind/KimchiBot", int(url.split("#")[-1])),
+#     )
 #     @patch.object(GithubProvider, 'repo_obj')
 #     async def test_extract_tickets(self, mock_repo, mock_parse_issue_url, mock_user_desc):
 #         """
@@ -49,7 +53,11 @@
 #         print("\n Test Passed: extract_tickets() successfully retrieved ticket info!")
 #
 #     @patch.object(GithubProvider, 'get_user_description', return_value="Fixes #1 and relates to #2")
-#     @patch.object(GithubProvider, '_parse_issue_url', side_effect=lambda url: ("WonOfAKind/KimchiBot", int(url.split('#')[-1])))
+#     @patch.object(
+#         GithubProvider,
+#         "_parse_issue_url",
+#         side_effect=lambda url: ("WonOfAKind/KimchiBot", int(url.split("#")[-1])),
+#     )
 #     @patch.object(GithubProvider, 'repo_obj')
 #     async def test_extract_and_cache_pr_tickets(self, mock_repo, mock_parse_issue_url, mock_user_desc):
 #         """
@@ -101,7 +109,11 @@
 #         Test fetch_sub_issues() to ensure an empty set is returned for an issue with no sub-issues.
 #         """
 #         github_provider = GithubProvider()
+<<<<<<< HEAD
 #         issue_url = "https://github.com/qodo-ai/dvmn-agent/issues/1499"  # Likely non-existent issue
+=======
+#         issue_url = "https://github.com/the-pr-agent/pr-agent/issues/1499"  # Likely non-existent issue
+>>>>>>> upstream/main
 #         result = github_provider.fetch_sub_issues(issue_url)
 #
 #         print("Fetched sub-issues for non-existent issue:", result)
