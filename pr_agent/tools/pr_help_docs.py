@@ -4,16 +4,28 @@ import os
 import re
 from functools import partial
 from tempfile import TemporaryDirectory
+from uuid import uuid4
 
+from jinja2 import StrictUndefined
+from jinja2.sandbox import SandboxedEnvironment
+
+<<<<<<< HEAD
 from jinja2 import Environment, StrictUndefined
 
 from pr_agent.algo import MAX_TOKENS
+=======
+>>>>>>> upstream/main
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
-from pr_agent.algo.pr_processing import retry_with_fallback_models
+from pr_agent.algo.pr_processing import OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD, retry_with_fallback_models
+from pr_agent.algo.token_budget import AttemptTokenBudget, FittedPrompt, clip_tokens
 from pr_agent.algo.token_handler import TokenHandler
+<<<<<<< HEAD
 from pr_agent.algo.utils import (ModelType, clip_tokens, get_max_tokens,
                                  load_yaml)
+=======
+from pr_agent.algo.utils import ModelType, load_yaml
+>>>>>>> upstream/main
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import get_git_provider_with_context
 from pr_agent.log import get_logger
@@ -27,7 +39,8 @@ def modify_answer_section(ai_response: str) -> str | None:
     """
     For example: The following input:
 
-    ### Question: \nThe following general issue was asked by a user: Title: How does one request to re-review a PR? More Info: I cannot seem to find to do this.
+    ### Question: \nThe following general issue was asked by a user: Title: How does one request to re-review a PR?
+    More Info: I cannot seem to find to do this.
     ### Answer:\nAccording to the documentation, one needs to invoke the command: /review
     #### Relevant Sources...
 
@@ -70,6 +83,11 @@ def extract_model_answer_and_relevant_sources(ai_response: str) -> str | None:
             get_logger().info(f"Found model answer: {model_answer_section_in_response}")
             return model_answer_and_relevant_sources_sections_in_response \
                 if len(model_answer_section_in_response) > 0 else None
+        if model_answer_and_relevant_sources_sections_in_response.strip():
+            get_logger().info(
+                f"Found model answer without relevant sources: {model_answer_and_relevant_sources_sections_in_response}"
+            )
+            return model_answer_and_relevant_sources_sections_in_response
     get_logger().warning(f"Either no answer section found, or that section is malformed: {ai_response}")
     return None
 
@@ -84,7 +102,7 @@ def return_document_headings(text: str, ext: str) -> str:
         lines = text.split('\n')
         headings = set()
 
-        if not text or not re.search(r'[a-zA-Z]', text):
+        if not text or not any(char.isalpha() for char in text):
             get_logger().error(f"Empty or non text content found in text: {text}.")
             return ""
 
@@ -93,7 +111,8 @@ def return_document_headings(text: str, ext: str) -> str:
             headings = {line.strip() for line in lines if line.strip().startswith('#')}
         elif ext == '.rst':
             # Find indices of lines that have all same character:
-            #Allowed characters according to list from: https://docutils.sourceforge.io/docs/ref/rst/restructuredtext.html#sections
+            # Allowed characters according to list from:
+            # https://docutils.sourceforge.io/docs/ref/rst/restructuredtext.html#sections
             section_chars = set('!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~')
 
             # Find potential section marker lines (underlines/overlines): They have to be the same character
@@ -113,23 +132,44 @@ def return_document_headings(text: str, ext: str) -> str:
             return ""
 
         return '\n'.join(headings)
-    except Exception as e:
-        get_logger().exception(f"Unexpected exception thrown. Returning empty result.")
+    except Exception:
+        get_logger().exception("Unexpected exception thrown. Returning empty result.")
         return ""
 
 # Load documentation files to memory: full file path (as will be given as prompt) -> doc contents
-def map_documentation_files_to_contents(base_path: str, doc_files: list[str], max_allowed_file_len=5000) -> dict[str, str]:
+def map_documentation_files_to_contents(base_path: str, doc_files: list[str],
+                                        max_allowed_file_len=5000) -> dict[str, str]:
     try:
         returned_dict = {}
         for file in doc_files:
             try:
-                with open(file, 'r', encoding='utf-8') as f:
-                    content = f.read()
+                with open(file, encoding='utf-8') as f:
+                    if max_allowed_file_len < 0:
+                        content = f.read()
+                        content_length = len(content)
+                        has_text = any(map(str.isalpha, content))
+                    else:
+                        content_parts = []
+                        remaining = max_allowed_file_len
+                        content_length = 0
+                        has_text = False
+                        while chunk := f.read(64 * 1024):
+                            content_length += len(chunk)
+                            if remaining > 0:
+                                prefix = chunk[:remaining]
+                                content_parts.append(prefix)
+                                remaining -= len(prefix)
+                            if not has_text:
+                                has_text = any(map(str.isalpha, chunk))
+                        content = ''.join(content_parts)
                     # Skip files with no text content
-                    if not re.search(r'[a-zA-Z]', content):
+                    if not has_text:
                         continue
-                    if len(content) > max_allowed_file_len:
-                        get_logger().warning(f"File {file} length: {len(content)} exceeds limit: {max_allowed_file_len}, so it will be trimmed.")
+                    if content_length > max_allowed_file_len:
+                        get_logger().warning(
+                            f"File {file} length: {content_length} exceeds limit: "
+                            f"{max_allowed_file_len}, so it will be trimmed."
+                        )
                         content = content[:max_allowed_file_len]
                     file_path = str(file).replace(str(base_path), '')
                     returned_dict[file_path] = content.strip()
@@ -139,13 +179,14 @@ def map_documentation_files_to_contents(base_path: str, doc_files: list[str], ma
         if not returned_dict:
             get_logger().error("Couldn't find any usable documentation files. Returning empty dict.")
         return returned_dict
-    except Exception as e:
-        get_logger().exception(f"Unexpected exception thrown. Returning empty dict.")
+    except Exception:
+        get_logger().exception("Unexpected exception thrown. Returning empty dict.")
         return {}
 
-# Goes over files' contents, generating payload for prompt while decorating them with a header to mark where each file begins,
-# as to help the LLM to give a better answer.
-def aggregate_documentation_files_for_prompt_contents(file_path_to_contents: dict[str, str], return_just_headings=False) -> str:
+# Goes over files' contents, generating payload for prompt while decorating them with a header to mark where each file
+# begins, as to help the LLM to give a better answer.
+def aggregate_documentation_files_for_prompt_contents(file_path_to_contents: dict[str, str],
+                                                      return_just_headings=False) -> str:
     try:
         docs_prompt = ""
         for idx, file_path in enumerate(file_path_to_contents):
@@ -156,40 +197,61 @@ def aggregate_documentation_files_for_prompt_contents(file_path_to_contents: dic
             if return_just_headings:
                 file_headings = return_document_headings(file_contents, os.path.splitext(file_path)[-1]).strip()
                 if file_headings:
-                    docs_prompt += f"\n==file name==\n\n{file_path}\n\n==index==\n\n{idx}\n\n==file headings==\n\n{file_headings}\n=========\n\n"
+                    docs_prompt += (
+                        f"\n==file name==\n\n{file_path}\n\n==index==\n\n{idx}\n\n==file headings==\n\n"
+                        f"{file_headings}\n=========\n\n"
+                    )
                 else:
                     get_logger().warning(f"No headers for: {file_path}. Will only use filename")
                     docs_prompt += f"\n==file name==\n\n{file_path}\n\n==index==\n\n{idx}\n\n"
             else:
                 docs_prompt += f"\n==file name==\n\n{file_path}\n\n==file content==\n\n{file_contents}\n=========\n\n"
         return docs_prompt
-    except Exception as e:
-        get_logger().exception(f"Unexpected exception thrown. Returning empty result.")
+    except Exception:
+        get_logger().exception("Unexpected exception thrown. Returning empty result.")
         return ""
 
-def format_markdown_q_and_a_response(question_str: str, response_str: str, relevant_sections: list[dict[str, str]],
-                                     supported_suffixes: list[str], base_url_prefix: str, base_url_suffix: str="") -> str:
+def format_markdown_q_and_a_response(question_str: str, response_str: str,
+                                     relevant_sections: list[dict[str, str]],
+                                     supported_suffixes: list[str], base_url_prefix: str,
+                                     base_url_suffix: str = "") -> str:
     try:
-        base_url_prefix = base_url_prefix.strip('/') #Sanitize base_url_prefix
+        base_url_prefix = base_url_prefix.strip('/')  # Sanitize base_url_prefix
         answer_str = ""
         answer_str += f"### Question: \n{question_str}\n\n"
         answer_str += f"### Answer:\n{response_str.strip()}\n\n"
-        answer_str += f"#### Relevant Sources:\n\n"
+        source_links = []
+        if not isinstance(relevant_sections, list):
+            get_logger().warning("Skipping malformed relevant source collection: expected a list")
+            relevant_sections = []
         for section in relevant_sections:
-            file = section.get('file_name').lstrip('/').strip() #Remove any '/' in the beginning, since some models do it anyway
+            try:
+                if not isinstance(section, dict):
+                    raise ValueError("source row is not a mapping")
+                file_name = section.get('file_name')
+                header = section.get('relevant_section_header_string')
+                if not isinstance(file_name, str) or not isinstance(header, str):
+                    raise ValueError("source row has an invalid file name or section header")
+            except ValueError as e:
+                get_logger().warning(f"Skipping malformed relevant source row: {e}")
+                continue
+            file = file_name.lstrip('/').strip()  # Remove any leading '/', since some models add one
             ext = [suffix for suffix in supported_suffixes if file.endswith(suffix)]
             if not ext:
                 get_logger().warning(f"Unsupported file extension: {file}")
                 continue
-            if str(section['relevant_section_header_string']).strip():
-                markdown_header = format_markdown_header(section['relevant_section_header_string'])
+            if header.strip():
+                markdown_header = format_markdown_header(header)
                 if base_url_prefix:
-                    answer_str += f"> - {base_url_prefix}/{file}{base_url_suffix}#{markdown_header}\n"
+                    source_links.append(f"> - {base_url_prefix}/{file}{base_url_suffix}#{markdown_header}\n")
             else:
-                answer_str += f"> - {base_url_prefix}/{file}{base_url_suffix}\n"
+                source_links.append(f"> - {base_url_prefix}/{file}{base_url_suffix}\n")
+        if source_links:
+            answer_str += "#### Relevant Sources:\n\n"
+            answer_str += ''.join(source_links)
         return answer_str
-    except Exception as e:
-        get_logger().exception(f"Unexpected exception thrown. Returning empty result.")
+    except Exception:
+        get_logger().exception("Unexpected exception thrown. Returning empty result.")
         return ""
 
 def format_markdown_header(header: str) -> str:
@@ -216,18 +278,41 @@ def format_markdown_header(header: str) -> str:
         # Perform replacements in a single pass and convert to lowercase
         return pattern.sub(lambda m: replacements[m.group()], cleaned).lower()
     except Exception:
-        get_logger().exception(f"Error while formatting markdown header", artifacts={'header': header})
+        get_logger().exception("Error while formatting markdown header", artifacts={'header': header})
         return ""
+
+
+def get_valid_ranking_indices(ranking: list[dict], number_of_documents: int) -> list[int]:
+    """Return in-range document indices while isolating malformed ranking rows."""
+    valid_indices = []
+    if not isinstance(ranking, list):
+        get_logger().warning("Skipping malformed relevant file ranking collection: expected a list")
+        return valid_indices
+    for entry in ranking:
+        try:
+            if not isinstance(entry, dict):
+                raise ValueError("ranking row is not a mapping")
+            raw_index = entry.get('idx')
+            if isinstance(raw_index, bool) or not isinstance(raw_index, (int, str)):
+                raise ValueError("ranking index has an invalid type")
+            index = int(raw_index)
+            if 0 <= index < number_of_documents:
+                valid_indices.append(index)
+            else:
+                raise ValueError("ranking index is out of range")
+        except (TypeError, ValueError) as e:
+            get_logger().warning(f"Skipping malformed relevant file ranking row: {e}")
+    return valid_indices
 
 def clean_markdown_content(content: str) -> str:
     """
-    Remove hidden comments and unnecessary elements from markdown content to reduce size.
+    Remove hidden comments and unnecessary elements from Markdown content to reduce size.
 
     Args:
-        content: The original markdown content
+        content: The original Markdown content
 
     Returns:
-        Cleaned markdown content
+        Cleaned Markdown content
     """
     try:
         # Remove HTML comments
@@ -253,21 +338,86 @@ def clean_markdown_content(content: str) -> str:
         content = re.sub(r'<(?!table|tr|td|th|thead|tbody)([a-zA-Z][a-zA-Z0-9]*)[^>]*>(.*?)</\1>',
                          r'\2', content, flags=re.DOTALL)
         return content.strip()
-    except Exception as e:
-        get_logger().exception(f"Unexpected exception thrown. Returning empty result.")
+    except Exception:
+        get_logger().exception("Unexpected exception thrown. Returning empty result.")
         return ""
+
+
+def _clean_markdown_content_preserving_fences(content: str) -> str:
+    """Clean one document without rewriting fenced examples."""
+    if "```" not in content and "~~~" not in content:
+        return clean_markdown_content(content)
+
+    marker = f"\x00{uuid4().hex}:"
+    masked_lines = []
+    blocks = []
+    fence = ""
+    for line_match in re.finditer(r"[^\r\n]*(?:\r\n?|\n|$)", content):
+        line = line_match[0]
+        fence_line = line.removeprefix("\ufeff") if line_match.start() == 0 else line
+        match = re.match(r" {0,3}(`{3,}|~{3,})([^\r\n]*)", fence_line)
+        if fence:
+            blocks[-1].append(line)
+            if (match and match[1][0] == fence[0] and len(match[1]) >= len(fence)
+                    and not match[2].strip(" \t")):
+                fence = ""
+        elif match and (match[1][0] == "~" or "`" not in match[2]):
+            fence = match[1]
+            masked_lines.append(f"{marker}{len(blocks)}\x00")
+            blocks.append([line])
+        elif re.match(r"[ \t]*(?:(?:>|[-+*]|[0-9]+[.)])[ \t]*)*(?:`{3,}|~{3,})", line):
+            # Keep ambiguous/container fences intact rather than parse nested Markdown here.
+            return content
+        else:
+            masked_lines.append(line)
+
+    # Preserve unclosed fences through this file's end, including truncated examples.
+    # Mask the whole block so comments, tags, images and whitespace inside it stay literal.
+    cleaned = clean_markdown_content("".join(masked_lines))
+    placeholder = re.compile(re.escape(marker) + r"([0-9]+)\x00")
+    if placeholder.findall(cleaned) != [str(index) for index in range(len(blocks))]:
+        # Keep the original document if cleanup removes a protected example.
+        return content
+    return placeholder.sub(lambda match: "".join(blocks[int(match[1])]), cleaned)
+
 
 class PredictionPreparator:
     def __init__(self, ai_handler, vars, system_prompt, user_prompt):
+        self.ai_handler = ai_handler
+        self._vars = copy.deepcopy(vars)
+        self._system_prompt = system_prompt
+        self._user_prompt = user_prompt
         try:
-            self.ai_handler = ai_handler
-            variables = copy.deepcopy(vars)
-            environment = Environment(undefined=StrictUndefined)
-            self.system_prompt = environment.from_string(system_prompt).render(variables)
-            self.user_prompt = environment.from_string(user_prompt).render(variables)
-        except Exception as e:
-            get_logger().exception(f"Caught exception during init. Setting ai_handler to None to prevent __call__.")
+            environment = SandboxedEnvironment(undefined=StrictUndefined)
+            environment.from_string(system_prompt).render(self._vars)
+            environment.from_string(user_prompt).render(self._vars)
+        except Exception:
+            get_logger().exception("Caught exception during init. Setting ai_handler to None to prevent __call__.")
             self.ai_handler = None
+
+    def _fit_snippets_for_model(self, model: str) -> FittedPrompt:
+        # Size the documentation text against the exact request that will be
+        # dispatched: the model context minus the output reserve and the fixed
+        # rendered system/user prompt. Each fallback model is fit independently,
+        # so a smaller model never retries an over-budget prompt.
+        budget = AttemptTokenBudget.for_prompt_attempt(
+            model,
+            None,
+            self._vars,
+            self._system_prompt,
+            self._user_prompt,
+            ai_handler=self.ai_handler,
+            output_token_reserve=getattr(self.ai_handler, "get_output_token_reserve", None),
+            ignore_max_model_tokens=True,
+        )
+        return budget.fit_prompt_variable(
+            self._vars,
+            "snippets",
+            self._vars.get("snippets", ""),
+            ai_handler=self.ai_handler,
+            default_output_tokens=OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD,
+            preserve_minimum=True,
+        )
 
     #Called by retry_with_fallback_models and therefore, on any failure must throw an exception:
     async def __call__(self, model: str) -> str:
@@ -275,23 +425,28 @@ class PredictionPreparator:
             get_logger().error("ai handler not set. Cannot invoke model!")
             raise ValueError("PredictionPreparator not initialized")
         try:
+            fitted = self._fit_snippets_for_model(model)
             response, finish_reason = await self.ai_handler.chat_completion(
-                model=model, temperature=get_settings().config.temperature, system=self.system_prompt, user=self.user_prompt)
+                model=model, temperature=get_settings().config.temperature,
+                system=fitted.system_prompt, user=fitted.user_prompt)
             return response
         except Exception as e:
-            get_logger().exception("Caught exception during prediction.", artifacts={'system': self.system_prompt, 'user': self.user_prompt})
+            get_logger().exception(
+                "Caught exception during prediction.", artifacts={'model': model})
             raise e
 
 
-class PRHelpDocs(object):
-    def __init__(self, ctx_url, ai_handler:partial[BaseAiHandler,] = LiteLLMAIHandler, args: tuple[str]=None, return_as_string: bool=False):
+class PRHelpDocs:
+    def __init__(self, ctx_url, ai_handler: partial[BaseAiHandler,] = LiteLLMAIHandler,
+             args: tuple[str] = None, return_as_string: bool = False):
         try:
             self.ctx_url = ctx_url
             self.question = args[0] if args else None
             self.return_as_string = return_as_string
             self.repo_url_given_explicitly = True
             self.repo_url = get_settings().get('PR_HELP_DOCS.REPO_URL', '')
-            self.repo_desired_branch = get_settings().get('PR_HELP_DOCS.REPO_DEFAULT_BRANCH', 'main') #Ignored if self.repo_url is empty
+            self.repo_desired_branch = get_settings().get('PR_HELP_DOCS.REPO_DEFAULT_BRANCH', 'main')
+            # Ignored if self.repo_url is empty
             self.include_root_readme_file = not(get_settings()['PR_HELP_DOCS.EXCLUDE_ROOT_README'])
             self.supported_doc_exts = get_settings()['PR_HELP_DOCS.SUPPORTED_DOC_EXTS']
             self.docs_path = get_settings()['PR_HELP_DOCS.DOCS_PATH']
@@ -305,11 +460,15 @@ class PRHelpDocs(object):
                 raise Exception(f"No git provider found at {ctx_url}")
             if not self.repo_url:
                 self.repo_url_given_explicitly = False
-                get_logger().debug(f"No explicit repo url provided, deducing it from type: {self.git_provider.__class__.__name__} "
-                                  f"context url: {self.ctx_url}")
+                get_logger().debug(
+                    f"No explicit repo url provided, deducing it from type: "
+                    f"{self.git_provider.__class__.__name__} context url: {self.ctx_url}"
+                )
                 self.repo_url = self.git_provider.get_git_repo_url(self.ctx_url)
                 if not self.repo_url:
-                    raise Exception(f"Unable to deduce repo url from type: {self.git_provider.__class__.__name__} url: {self.ctx_url}")
+                    raise Exception(
+                    f"Unable to deduce repo url from type: {self.git_provider.__class__.__name__} url: {self.ctx_url}"
+                )
                 get_logger().debug(f"deduced repo url: {self.repo_url}")
                 self.repo_desired_branch = None #Inferred from the repo provider.
 
@@ -323,8 +482,10 @@ class PRHelpDocs(object):
                                                   self.vars,
                                                   get_settings().pr_help_docs_prompts.system,
                                                   get_settings().pr_help_docs_prompts.user)
-        except Exception as e:
-            get_logger().exception(f"Caught exception during init. Setting self.question to None to prevent run() to do anything.")
+        except Exception:
+            get_logger().exception(
+                "Caught exception during init. Setting self.question to None to prevent run() to do anything."
+            )
             self.question = None
 
     async def run(self):
@@ -339,27 +500,39 @@ class PRHelpDocs(object):
             #Generate prompt for the AI model. This will be the full text of all the documentation files combined.
             docs_prompt = aggregate_documentation_files_for_prompt_contents(docs_filepath_to_contents)
             if not docs_filepath_to_contents or not docs_prompt:
-                get_logger().warning(f"Could not find any usable documentation. Returning with no result...")
+                get_logger().warning("Could not find any usable documentation. Returning with no result...")
                 return None
             docs_prompt_to_send_to_model = docs_prompt
 
             # Estimate how many tokens will be needed.
-            # In case the expected number of tokens exceeds LLM limits, retry with just headings, asking the LLM to rank according to relevance to the question.
-            # Based on returned ranking, rerun but sort the documents accordingly, this time, trim in case of exceeding limit.
+            # In case the expected number of tokens exceeds LLM limits, retry with just headings,
+            # asking the LLM to rank according to relevance to the question.
+            # Based on returned ranking, rerun but sort the documents accordingly,
+            # this time, trim in case of exceeding limit.
 
             #First, check if the text is not too long to even query the LLM provider:
             max_allowed_txt_input = get_maximal_text_input_length_for_token_count_estimation()
             invoke_llm_just_with_headings = self._trim_docs_input(docs_prompt_to_send_to_model, max_allowed_txt_input,
                                                                   only_return_if_trim_needed=True)
             if invoke_llm_just_with_headings:
-                #Entire docs is too long. Rank and return according to relevance.
-                docs_prompt_to_send_to_model = await self._rank_docs_and_return_them_as_prompt(docs_filepath_to_contents,
-                                                                                         max_allowed_txt_input)
+                # Avoid ranking a subset when cleaning alone makes all documentation fit.
+                cleaned_docs_prompt = aggregate_documentation_files_for_prompt_contents({
+                    path: _clean_markdown_content_preserving_fences(content)
+                    for path, content in docs_filepath_to_contents.items()
+                })
+                if cleaned_docs_prompt and not self._trim_docs_input(
+                        cleaned_docs_prompt, max_allowed_txt_input, only_return_if_trim_needed=True):
+                    docs_prompt_to_send_to_model = cleaned_docs_prompt
+                else:
+                    docs_prompt_to_send_to_model = await self._rank_docs_and_return_them_as_prompt(
+                        docs_filepath_to_contents, max_allowed_txt_input
+                    )
 
             if not docs_prompt_to_send_to_model:
                 get_logger().error("Failed to generate docs prompt for model. Returning with no result...")
                 return
-            # At this point, either all original documents be used (if their total length doesn't exceed limits), or only those selected.
+            # At this point, either all original documents be used (if their total length doesn't exceed limits),
+            # or only those selected.
             self.vars['snippets'] = docs_prompt_to_send_to_model.strip()
             # Run the AI model and extract sections from its response
             response = await retry_with_fallback_models(PredictionPreparator(self.ai_handler, self.vars,
@@ -372,12 +545,14 @@ class PRHelpDocs(object):
                 return
             response_str = response_yaml.get('response')
             relevant_sections = response_yaml.get('relevant_sections')
-            if not response_str or not relevant_sections:
-                get_logger().error("Failed to extract response/relevant sections.",
-                                       artifacts={'raw_response': response, 'response_str': response_str, 'relevant_sections': relevant_sections})
+            if not response_str:
+                get_logger().error(
+                    "Failed to extract response.",
+                    artifacts={'raw_response': response, 'response_str': response_str,
+                               'relevant_sections': relevant_sections})
                 return
             if int(response_yaml.get('question_is_relevant', '1')) == 0:
-                get_logger().warning(f"Question is not relevant. Returning without an answer...",
+                get_logger().warning("Question is not relevant. Returning without an answer...",
                                          artifacts={'raw_response': response})
                 return
 
@@ -385,16 +560,19 @@ class PRHelpDocs(object):
             answer_str = self._format_model_answer(response_str, relevant_sections)
             if self.return_as_string: #Skip publishing
                 return answer_str
-            #Otherwise, publish the answer if answer is non empty and publish is not turned off:
+            #Otherwise, publish the answer if answer is non-empty and publish is not turned off:
             if answer_str and get_settings().config.publish_output:
                 self.git_provider.publish_comment(answer_str)
             else:
                 get_logger().info("Answer:", artifacts={'answer_str': answer_str})
             return answer_str
-        except Exception as e:
-            get_logger().exception('failed to provide answer to given user question as a result of a thrown exception (see above)')
+        except Exception:
+            get_logger().exception(
+                'failed to provide answer to given user question as a result of a thrown exception (see above)'
+            )
 
-    def _find_all_document_files_matching_exts(self, abs_docs_path: str, ignore_readme=False, max_allowed_files=5000) -> list[str]:
+    def _find_all_document_files_matching_exts(self, abs_docs_path: str, ignore_readme=False,
+                                           max_allowed_files=5000) -> list[str]:
         try:
             matching_files = []
 
@@ -405,19 +583,41 @@ class PRHelpDocs(object):
             file_cntr = 0
             for root, _, files in os.walk(abs_docs_path):
                 for file in files:
-                    if ignore_readme and root == abs_docs_path and file.lower() in [f"readme.{ext}" for ext in dotless_extensions]:
+                    if ignore_readme and root == abs_docs_path and file.lower() in [
+                        f"readme.{ext}" for ext in dotless_extensions
+                    ]:
                         continue
                     # Check if file has one of the specified extensions
                     if any(file.lower().endswith(f'.{ext}') for ext in dotless_extensions):
                         file_cntr+=1
                         matching_files.append(os.path.join(root, file))
                         if file_cntr >= max_allowed_files:
-                            get_logger().warning(f"Found at least {max_allowed_files} files in {abs_docs_path}, skipping the rest.")
+                            get_logger().warning(
+                            f"Found at least {max_allowed_files} files in {abs_docs_path}, skipping the rest."
+                        )
                             return matching_files
             return matching_files
-        except Exception as e:
-            get_logger().exception(f"Unexpected exception thrown. Returning empty list.")
+        except Exception:
+            get_logger().exception("Unexpected exception thrown. Returning empty list.")
             return []
+
+    def _filter_doc_files_under_clone(self, doc_files: list[str], clone_root: str) -> list[str]:
+        """Drop candidates whose resolved path leaves the cloned repository root.
+
+        Symlinked documentation files can point outside the clone at host files; resolving
+        each candidate keeps anything that escapes from ever being read into the model prompt.
+        """
+        contained = []
+        for file_path in doc_files:
+            resolved = os.path.realpath(file_path)
+            if resolved != clone_root and not resolved.startswith(clone_root + os.sep):
+                get_logger().warning(
+                    f"Documentation file '{file_path}' resolves outside the cloned repository "
+                    "root; skipping it"
+                )
+                continue
+            contained.append(file_path)
+        return contained
 
     def _gen_filenames_to_contents_map_from_repo(self) -> dict[str, str]:
         try:
@@ -427,7 +627,7 @@ class PRHelpDocs(object):
                 if not returned_cloned_repo_root:
                     raise Exception(f"Failed to clone {self.repo_url} to {tmp_dir}")
 
-                get_logger().debug(f"About to gather relevant documentation files...")
+                get_logger().debug("About to gather relevant documentation files...")
                 doc_files = []
                 if self.include_root_readme_file:
                     for root, _, files in os.walk(returned_cloned_repo_root.path):
@@ -436,52 +636,96 @@ class PRHelpDocs(object):
                             for file in files:
                                 if file.lower().startswith("readme."):
                                     doc_files.append(os.path.join(root, file))
-                abs_docs_path = os.path.join(returned_cloned_repo_root.path, self.docs_path)
-                if os.path.exists(abs_docs_path):
-                    doc_files.extend(self._find_all_document_files_matching_exts(abs_docs_path,
-                                                                                 ignore_readme=(self.docs_path=='.')))
-                    if not doc_files:
-                        get_logger().warning(f"No documentation files found matching file extensions: "
-                                             f"{self.supported_doc_exts} under repo: {self.repo_url} "
-                                             f"path: {self.docs_path}. Returning empty dict.")
-                        return {}
+                        break
+                # Resolve docs_path against the clone root and refuse paths that escape it:
+                # an absolute or traversing docs_path (e.g. an attacker-controlled per-directory
+                # setting) must never read host files into the prompt.
+                clone_root = os.path.realpath(returned_cloned_repo_root.path)
+                resolved_docs_path = os.path.realpath(os.path.join(clone_root, self.docs_path))
+                if resolved_docs_path == clone_root or resolved_docs_path.startswith(clone_root + os.sep):
+                    if os.path.exists(resolved_docs_path):
+                        doc_files.extend(
+                            self._find_all_document_files_matching_exts(resolved_docs_path,
+                                                                        ignore_readme=(self.docs_path=='.')))
+                else:
+                    get_logger().warning(
+                        f"docs_path '{self.docs_path}' escapes the cloned repository root; "
+                        "skipping docs-path file gathering"
+                    )
+                # Individual files can still escape the clone through symlinks (a doc or root
+                # README that points at a host file). Resolve every candidate and refuse
+                # anything that leaves the canonical clone root so host files never reach the prompt.
+                doc_files = self._filter_doc_files_under_clone(doc_files, clone_root)
+                if not doc_files:
+                    get_logger().warning(f"No documentation files found matching file extensions: "
+                                         f"{self.supported_doc_exts} under repo: {self.repo_url} "
+                                         f"path: {self.docs_path}. Returning empty dict.")
+                    return {}
 
                 get_logger().info(f'For context {self.ctx_url} and repo: {self.repo_url}'
                                   f' will be using the following documentation files: ',
                                   artifacts={'doc_files': doc_files})
 
                 return map_documentation_files_to_contents(returned_cloned_repo_root.path, doc_files)
-        except Exception as e:
-            get_logger().exception(f"Unexpected exception thrown. Returning empty dict.")
+        except Exception:
+            get_logger().exception("Unexpected exception thrown. Returning empty dict.")
             return {}
 
-    def _trim_docs_input(self, docs_input: str, max_allowed_txt_input: int, only_return_if_trim_needed=False) -> bool|str:
+    def _docs_input_token_limit(self) -> int:
+        """Verified input budget that the documentation text alone may occupy.
+
+        The rendered system and user prompts (with empty snippets) are measured
+        as the fixed overhead, so the dispatched request never exceeds the model
+        context once the docs are fitted inside this limit.
+        """
+        attempt_vars = dict(self.vars)
+        attempt_vars["snippets"] = ""
+        budget = AttemptTokenBudget.for_prompt_attempt(
+            get_settings().config.model,
+            None,
+            attempt_vars,
+            get_settings().pr_help_docs_prompts.system,
+            get_settings().pr_help_docs_prompts.user,
+            ai_handler=self.ai_handler,
+            output_token_reserve=getattr(self.ai_handler, "get_output_token_reserve", None),
+            ignore_max_model_tokens=True,
+        )
+        return budget.available_tokens(
+            OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD,
+            preserve_minimum=True,
+        )
+
+    def _trim_docs_input(self, docs_input: str, max_allowed_txt_input: int,
+                     only_return_if_trim_needed=False, already_cleaned=False) -> bool | str:
         try:
             if len(docs_input) >= max_allowed_txt_input:
                 get_logger().warning(
-                    f"Text length: {len(docs_input)} exceeds the current returned limit of {max_allowed_txt_input} just for token count estimation. Trimming the text...")
+                    f"Text length: {len(docs_input)} exceeds the current returned limit of {max_allowed_txt_input} "
+                    f"just for token count estimation. Trimming the text...")
                 if only_return_if_trim_needed:
                     return True
                 docs_input = docs_input[:max_allowed_txt_input]
             # Then, count the tokens in the prompt. If the count exceeds the limit, trim the text.
             token_count = self.token_handler.count_tokens(docs_input, force_accurate=True)
             get_logger().debug(f"Estimated token count of documentation to send to model: {token_count}")
-            model = get_settings().config.model
-            if model in MAX_TOKENS:
-                max_tokens_full = MAX_TOKENS[
-                    model]  # note - here we take the actual max tokens, without any reductions. we do aim to get the full documentation website in the prompt
-            else:
-                max_tokens_full = get_max_tokens(model)
-            delta_output = 5000  # Elbow room to reduce chance of exceeding token limit or model paying less attention to prompt guidelines.
-            if token_count > max_tokens_full - delta_output:
+            # Size against the verified request budget instead of a hard-coded
+            # margin: the model context minus the output reserve and the fixed
+            # system/user prompt overhead.
+            input_limit = self._docs_input_token_limit()
+            if token_count > input_limit:
                 if only_return_if_trim_needed:
                     return True
-                docs_input = clean_markdown_content(
-                    docs_input)  # Reduce unnecessary text/images/etc.
-                get_logger().info(
-                    f"Token count {token_count} exceeds the limit {max_tokens_full - delta_output}. Attempting to clip text to fit within the limit...")
-                docs_input = clip_tokens(docs_input, max_tokens_full - delta_output,
-                                                           num_input_tokens=token_count)
+                if not already_cleaned:
+                    docs_input = clean_markdown_content(
+                        docs_input)  # Reduce unnecessary text/images/etc.
+                cleaned_token_count = (token_count if already_cleaned else
+                                       self.token_handler.count_tokens(docs_input, force_accurate=True))
+                if cleaned_token_count > input_limit:
+                    get_logger().info(
+                        f"Token count {cleaned_token_count} exceeds the input limit {input_limit}."
+                        f" Attempting to clip text to fit within the limit...")
+                    docs_input = clip_tokens(docs_input, input_limit,
+                                             num_input_tokens=cleaned_token_count)
             if only_return_if_trim_needed:
                 return False
             return docs_input
@@ -489,10 +733,11 @@ class PRHelpDocs(object):
             # Unexpected exception. Rethrowing it since:
             # 1. This is an internal function.
             # 2. An empty str/False result is a valid one - would require now checking also for None.
-            get_logger().exception(f"Unexpected exception thrown. Rethrowing it...")
+            get_logger().exception("Unexpected exception thrown. Rethrowing it...")
             raise e
 
-    async def _rank_docs_and_return_them_as_prompt(self, docs_filepath_to_contents: dict[str, str], max_allowed_txt_input: int) -> str:
+    async def _rank_docs_and_return_them_as_prompt(
+            self, docs_filepath_to_contents: dict[str, str], max_allowed_txt_input: int) -> str:
         try:
             #Return just file name and their headings (if exist):
             docs_prompt_to_send_to_model = (
@@ -507,55 +752,69 @@ class PRHelpDocs(object):
 
             self.vars['snippets'] = docs_prompt_to_send_to_model.strip()
             # Run the AI model and extract sections from its response
-            response = await retry_with_fallback_models(PredictionPreparator(self.ai_handler, self.vars,
-                                                                             get_settings().pr_help_docs_headings_prompts.system,
-                                                                             get_settings().pr_help_docs_headings_prompts.user),
-                                                        model_type=ModelType.REGULAR)
+            response = await retry_with_fallback_models(
+                PredictionPreparator(self.ai_handler, self.vars,
+                                    get_settings().pr_help_docs_headings_prompts.system,
+                                    get_settings().pr_help_docs_headings_prompts.user),
+                                    model_type=ModelType.REGULAR)
             response_yaml = load_yaml(response)
             if not response_yaml:
                 get_logger().error("Failed to parse the AI response.", artifacts={'response': response})
                 return ""
-            # else: Sanitize the output so that the file names match 1:1 dictionary keys. Do this via the file index and not its name, which may be altered by the model.
-            valid_indices = [int(entry['idx']) for entry in response_yaml.get('relevant_files_ranking')
-                             if int(entry['idx']) >= 0 and int(entry['idx']) < len(docs_filepath_to_contents)]
-            valid_file_paths = [list(docs_filepath_to_contents.keys())[idx] for idx in valid_indices]
-            selected_docs_dict = {file_path: docs_filepath_to_contents[file_path] for file_path in valid_file_paths}
+            # else: Sanitize the output so that the file names match 1:1 dictionary keys.
+            # Do this via the file index and not its name, which may be altered by the model.
+            valid_indices = get_valid_ranking_indices(response_yaml.get("relevant_files_ranking"),
+                                                      len(docs_filepath_to_contents))
+            doc_file_paths = list(docs_filepath_to_contents)
+            valid_file_paths = [doc_file_paths[idx] for idx in valid_indices]
+            selected_docs_dict = {path: docs_filepath_to_contents[path] for path in valid_file_paths}
+            docs_prompt = aggregate_documentation_files_for_prompt_contents(selected_docs_dict)
+            if not self._trim_docs_input(docs_prompt, max_allowed_txt_input, only_return_if_trim_needed=True):
+                return docs_prompt
+
+            selected_docs_dict = {
+                path: _clean_markdown_content_preserving_fences(content) for path, content in selected_docs_dict.items()
+            }
             docs_prompt = aggregate_documentation_files_for_prompt_contents(selected_docs_dict)
             docs_prompt_to_send_to_model = docs_prompt
 
             # Check if the updated list of documents does not exceed limits and trim if it does:
             docs_prompt_to_send_to_model = self._trim_docs_input(docs_prompt_to_send_to_model, max_allowed_txt_input,
-                                                                 only_return_if_trim_needed=False)
+                                                                 only_return_if_trim_needed=False,
+                                                                 already_cleaned=True)
             if not docs_prompt_to_send_to_model:
                 get_logger().error("_trim_docs_input returned an empty result.")
                 return ""
             return docs_prompt_to_send_to_model
-        except Exception as e:
-            get_logger().exception(f"Unexpected exception thrown. Returning empty result.")
+        except Exception:
+            get_logger().exception("Unexpected exception thrown. Returning empty result.")
             return ""
 
     def _format_model_answer(self, response_str: str, relevant_sections: list[dict[str, str]]) -> str:
         try:
             canonical_url_prefix, canonical_url_suffix = (
-                self.git_provider.get_canonical_url_parts(repo_git_url=self.repo_url if self.repo_url_given_explicitly else None,
-                                                          desired_branch=self.repo_desired_branch))
+                self.git_provider.get_canonical_url_parts(
+                    repo_git_url=self.repo_url if self.repo_url_given_explicitly else None,
+                    desired_branch=self.repo_desired_branch))
             answer_str = format_markdown_q_and_a_response(self.question, response_str, relevant_sections,
-                                                          self.supported_doc_exts, canonical_url_prefix, canonical_url_suffix)
+                                                          self.supported_doc_exts, canonical_url_prefix,
+                                                          canonical_url_suffix)
             if answer_str:
-                #Remove the question phrase and replace with light bulb and a heading mentioning this is an automated answer:
+                # Remove the question phrase and replace with light bulb
+                # and a heading mentioning this is an automated answer:
                 answer_str = modify_answer_section(answer_str)
             #In case the response should not be published and returned as string, stop here:
             if answer_str and self.return_as_string:
-                get_logger().info(f"Chat help docs answer", artifacts={'answer_str': answer_str})
+                get_logger().info("Chat help docs answer", artifacts={'answer_str': answer_str})
                 return answer_str
             if not answer_str:
-                get_logger().info(f"No answer found")
+                get_logger().info("No answer found")
                 return ""
             if self.git_provider.is_supported("gfm_markdown") and get_settings().pr_help_docs.enable_help_text:
                 answer_str += "<hr>\n\n<details> <summary><strong>💡 Tool usage guide:</strong></summary><hr> \n\n"
                 answer_str += HelpMessage.get_help_docs_usage_guide()
                 answer_str += "\n</details>\n"
             return answer_str
-        except Exception as e:
-            get_logger().exception(f"Unexpected exception thrown. Returning empty result.")
+        except Exception:
+            get_logger().exception("Unexpected exception thrown. Returning empty result.")
             return ""
