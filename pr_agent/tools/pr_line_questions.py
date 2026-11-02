@@ -1,11 +1,13 @@
-import argparse
 import copy
 from functools import partial
+from urllib.parse import unquote
 
-from jinja2 import Environment, StrictUndefined
+from jinja2 import StrictUndefined, select_autoescape
+from jinja2.sandbox import SandboxedEnvironment
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
+<<<<<<< HEAD
 from pr_agent.algo.git_patch_processing import (
     decouple_and_convert_to_hunks_with_lines_numbers,
     extract_hunk_lines_from_patch)
@@ -16,20 +18,45 @@ from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import get_git_provider
 from pr_agent.git_providers.git_provider import get_main_pr_language
 from pr_agent.git_providers.github_provider import GithubProvider
+=======
+from pr_agent.algo.git_patch_processing import extract_hunk_lines_from_patch
+from pr_agent.algo.language_handler import build_language_file_matcher
+from pr_agent.algo.pr_processing import OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD, retry_with_fallback_models
+from pr_agent.algo.run_details import init_run_details
+from pr_agent.algo.run_output import append_run_details
+from pr_agent.algo.skills_loader import get_skills_context
+from pr_agent.algo.token_budget import AttemptTokenBudget
+from pr_agent.algo.utils import ModelType, decode_user_text_args
+from pr_agent.config_loader import get_settings, get_verbosity_level
+from pr_agent.git_providers import get_git_provider_for_tool
+>>>>>>> upstream/main
 from pr_agent.log import get_logger
-from pr_agent.servers.help import HelpMessage
+from pr_agent.tools.pr_questions import _sanitize_slash_commands
+
 
 
 class PR_LineQuestions:
     def __init__(self, pr_url: str, args=None, ai_handler: partial[BaseAiHandler,] = LiteLLMAIHandler):
         self.question_str = self.parse_args(args)
-        self.git_provider = get_git_provider()(pr_url)
-        self.main_pr_language = get_main_pr_language(
-            self.git_provider.get_languages(), self.git_provider.get_files()
-        )
-        self.ai_handler = ai_handler()
-        self.ai_handler.main_pr_language = self.main_pr_language
+        self.git_provider = get_git_provider_for_tool(pr_url)
+        # Only the questioned file's language is needed for model-call logging.
+        # Loading the entire PR file inventory here can be expensive or incomplete.
+        file_name = get_settings().get("file_name", "") or ""
+        if get_settings().get("file_name_encoded", False):
+            file_name = unquote(file_name)
+        language_map = get_settings().get("language_extension_map_org", {}) or {}
+        try:
+            self.main_pr_language = (build_language_file_matcher(language_map)(file_name) or "").lower()
+        except (TypeError, ValueError, AttributeError) as exc:
+            get_logger().warning(f"Could not classify line question file for logging: {exc}")
+            self.main_pr_language = ""
+        self._ai_handler_factory = ai_handler
+        self.ai_handler = None
 
+        # Request the marker only for providers that can resolve threads;
+        # otherwise every resolved answer would log a failed resolve.
+        self.resolve_threads = (get_settings().pr_questions.get("resolve_threads", False)
+                                and self.git_provider.supports_thread_resolution())
         self.vars = {
             "title": self.git_provider.pr.title,
             "branch": self.git_provider.get_pr_branch(),
@@ -38,40 +65,56 @@ class PR_LineQuestions:
             "full_hunk": "",
             "selected_lines": "",
             "conversation_history": "",
+<<<<<<< HEAD
+=======
+            "resolve_threads": self.resolve_threads,
+            "is_azure_devops": self.git_provider.supports_threaded_pr_questions(),
+            "extra_instructions": get_settings().pr_questions.extra_instructions,
+            "skills_context": (
+                get_skills_context()
+                if get_settings().skills.get("enabled", False)
+                else ""
+            ),
+>>>>>>> upstream/main
         }
-        self.token_handler = TokenHandler(self.git_provider.pr,
-                                          self.vars,
-                                          get_settings().pr_line_questions_prompt.system,
-                                          get_settings().pr_line_questions_prompt.user)
         self.patches_diff = None
         self.prediction = None
 
+    def _ensure_ai_handler(self):
+        if self.ai_handler is None:
+            handler = self._ai_handler_factory()
+            handler.main_pr_language = self.main_pr_language
+            self.ai_handler = handler
+
     def parse_args(self, args):
-        if args and len(args) > 0:
-            question_str = " ".join(args)
-        else:
-            question_str = ""
-        return question_str
+        return decode_user_text_args(args)
 
 
     async def run(self):
+        # A fresh collector so the run-details section reports only this command's model.
+        init_run_details()
         get_logger().info('Answering a PR lines question...')
         # if get_settings().config.publish_output:
         #     self.git_provider.publish_comment("Preparing answer...", is_temporary=True)
 
-        # set conversation history if enabled
-        # currently only supports GitHub provider
-        if get_settings().pr_questions.use_conversation_history and isinstance(self.git_provider, GithubProvider):
+        if (get_settings().pr_questions.use_conversation_history
+                and self.git_provider.supports_line_question_history()):
             conversation_history = self._load_conversation_history()
             self.vars["conversation_history"] = conversation_history
 
         self.patch_with_lines = ""
+        self.selected_lines = ""
         ask_diff = get_settings().get('ask_diff_hunk', "")
         line_start = get_settings().get('line_start', '')
         line_end = get_settings().get('line_end', '')
         side = get_settings().get('side', 'RIGHT')
         file_name = get_settings().get('file_name', '')
+        if get_settings().get("file_name_encoded", False):
+            file_name = unquote(file_name)
         comment_id = get_settings().get('comment_id', '')
+        if not comment_id:
+            self.resolve_threads = False
+            self.vars["resolve_threads"] = False
         if ask_diff:
             self.patch_with_lines, self.selected_lines = extract_hunk_lines_from_patch(ask_diff,
                                                                                        file_name,
@@ -83,22 +126,58 @@ class PR_LineQuestions:
             diff_files = self.git_provider.get_diff_files()
             for file in diff_files:
                 if file.filename == file_name:
-                    self.patch_with_lines, self.selected_lines = extract_hunk_lines_from_patch(file.patch, file.filename,
+                    self.patch_with_lines, self.selected_lines = extract_hunk_lines_from_patch(file.patch,
+                                                                                               file.filename,
                                                                                                line_start=line_start,
                                                                                                line_end=line_end,
                                                                                                side=side)
-        if self.patch_with_lines:
+        # A matched hunk always contributes its '@@' header; a miss leaves only the file
+        # title. Gating on selected_lines instead would also silence the case where GitHub
+        # truncates diff_hunk from the front but keeps the original header, which leaves the
+        # requested line outside the shortened body with the hunk itself still present.
+        hunk_found = any(line.startswith('@@') for line in self.patch_with_lines.splitlines())
+        if hunk_found:
+            self._ensure_ai_handler()
             model_answer = await retry_with_fallback_models(self._get_prediction, model_type=ModelType.WEAK)
+
+            should_resolve = False
+            answer_stripped = model_answer.rstrip()
+            if self.resolve_threads and answer_stripped.endswith("[THREAD_RESOLVED]"):
+                should_resolve = True
+                model_answer = answer_stripped[:-len("[THREAD_RESOLVED]")].rstrip()
+
             # sanitize the answer so that no line will start with "/"
-            model_answer_sanitized = model_answer.strip().replace("\n/", "\n /")
-            if model_answer_sanitized.startswith("/"):
-                model_answer_sanitized = " " + model_answer_sanitized
+            model_answer_sanitized = _sanitize_slash_commands(model_answer.strip())
 
             get_logger().info('Preparing answer...')
+            if not get_settings().config.publish_output:
+                get_logger().info(f"Answer:\n{model_answer_sanitized}")
+                return ""
+            # Appended after sanitizing: the section's own lines never start with "/".
+            answer_body = append_run_details(model_answer_sanitized, self.git_provider)
             if comment_id:
-                self.git_provider.reply_to_comment_from_comment_id(comment_id, model_answer_sanitized)
+                self.git_provider.reply_to_comment_from_comment_id(comment_id, answer_body)
+                if should_resolve:
+                    if self.git_provider.resolve_comment_thread(comment_id):
+                        get_logger().info(f"Resolved review thread for comment {comment_id}")
+                    else:
+                        get_logger().warning(f"Failed to resolve review thread for comment {comment_id}")
             else:
-                self.git_provider.publish_comment(model_answer_sanitized)
+                self.git_provider.publish_comment(answer_body)
+        else:
+            get_logger().info("No hunk matched the requested range for "
+                              f"'{file_name}'; skipping the /ask_line model call")
+            # Without this the run is silent and the asker cannot tell us apart from a
+            # broken bot, so say why nothing was answered.
+            no_hunk_message = (f"Could not find the requested lines of `{file_name}` in this "
+                               "pull request's diff, so there is nothing to answer about.")
+            if not get_settings().config.publish_output:
+                get_logger().info(no_hunk_message)
+                return ""
+            if comment_id:
+                self.git_provider.reply_to_comment_from_comment_id(comment_id, no_hunk_message)
+            else:
+                self.git_provider.publish_comment(no_hunk_message)
 
         return ""
 
@@ -109,6 +188,8 @@ class PR_LineQuestions:
             str: The formatted conversation history
         """
         comment_id = get_settings().get('comment_id', '')
+        origin_comment_id = (get_settings().get("origin_comment_id", comment_id)
+                             if self.git_provider.supports_threaded_pr_questions() else comment_id)
         file_path = get_settings().get('file_name', '')
         line_number = get_settings().get('line_end', '')
 
@@ -124,14 +205,20 @@ class PR_LineQuestions:
             # filter and prepare comments
             filtered_comments = []
             for comment in thread_comments:
-                body = getattr(comment, 'body', '')
+                body = getattr(comment, "body", "")
 
                 # skip empty comments, current comment(will be added as a question at prompt)
-                if not body or not body.strip() or comment_id == comment.id:
+                if (not isinstance(body, str) or not body.strip()
+                        or origin_comment_id == getattr(comment, "id", None)):
                     continue
 
+<<<<<<< HEAD
                 user = comment.user
                 author = user.login if hasattr(user, 'login') else 'Unknown'
+=======
+                user = getattr(comment, "user", None)
+                author = getattr(user, "login", "Unknown")
+>>>>>>> upstream/main
                 filtered_comments.append((author, body))
 
             # transform conversation history to string using the same pattern as get_commit_messages
@@ -154,10 +241,10 @@ class PR_LineQuestions:
         variables = copy.deepcopy(self.vars)
         variables["full_hunk"] = self.patch_with_lines  # update diff
         variables["selected_lines"] = self.selected_lines
-        environment = Environment(undefined=StrictUndefined)
-        system_prompt = environment.from_string(get_settings().pr_line_questions_prompt.system).render(variables)
-        user_prompt = environment.from_string(get_settings().pr_line_questions_prompt.user).render(variables)
-        if get_settings().config.verbosity_level >= 2:
+        fitted = self._fit_conversation_history(variables, model)
+        variables["conversation_history"] = fitted.optional_text
+        system_prompt, user_prompt = fitted.system_prompt, fitted.user_prompt
+        if get_verbosity_level() >= 2:
             # get_logger().info(f"\nSystem prompt:\n{system_prompt}")
             # get_logger().info(f"\nUser prompt:\n{user_prompt}")
             print(f"\nSystem prompt:\n{system_prompt}")
@@ -166,3 +253,50 @@ class PR_LineQuestions:
         response, finish_reason = await self.ai_handler.chat_completion(
             model=model, temperature=get_settings().config.temperature, system=system_prompt, user=user_prompt)
         return response
+
+    def _render_prompts(self, variables):
+        environment = SandboxedEnvironment(
+            autoescape=select_autoescape(default_for_string=False),
+            undefined=StrictUndefined,
+        )
+        system_prompt = environment.from_string(get_settings().pr_line_questions_prompt.system).render(variables)
+        user_prompt = environment.from_string(get_settings().pr_line_questions_prompt.user).render(variables)
+        return system_prompt, user_prompt
+
+    def _fit_conversation_history(self, variables, model):
+        conversation_history = variables.get("conversation_history", "")
+        variables = copy.deepcopy(variables)
+        variables["conversation_history"] = ""
+        output_token_reserve = getattr(self.ai_handler, "get_output_token_reserve", None)
+        try:
+            completion_tokens = int(get_settings().config.get("max_output_tokens", 0))
+        except (TypeError, ValueError):
+            completion_tokens = 0
+        if not callable(output_token_reserve) and completion_tokens > 0:
+            def configured_output_reserve(_model, _default):
+                return completion_tokens
+
+            output_token_reserve = configured_output_reserve
+
+        budget = AttemptTokenBudget.for_prompt_attempt(
+            model,
+            getattr(self.git_provider, "pr", None),
+            variables,
+            get_settings().pr_line_questions_prompt.system,
+            get_settings().pr_line_questions_prompt.user,
+            ai_handler=self.ai_handler,
+            output_token_reserve=output_token_reserve,
+        )
+        fitted = budget.fit_prompt_variable(
+            variables,
+            "conversation_history",
+            conversation_history,
+            ai_handler=self.ai_handler,
+            default_output_tokens=OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
+            keep="suffix",
+        )
+        if fitted.optional_text != conversation_history:
+            get_logger().warning(
+                f"Conversation history was clipped for /ask_line to fit the token limit for {model}"
+            )
+        return fitted
