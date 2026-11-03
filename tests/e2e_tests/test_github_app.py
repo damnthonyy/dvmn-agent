@@ -63,7 +63,7 @@ def test_e2e_run_github_app():
 
         # check every 1 minute, for 5, minutes if the PR has all the tool results
         for i in range(NUM_MINUTES):
-            logger.info(f"Waiting for the PR to get all the tool results...")
+            logger.info("Waiting for the PR to get all the tool results...")
             time.sleep(60)
             logger.info(f"Checking the PR {pr.html_url} after {i + 1} minute(s)")
             pr.update()
@@ -78,7 +78,7 @@ def test_e2e_run_github_app():
             else:
                 logger.info(f"Waiting for the PR to get all the tool results. {i + 1} minute(s) passed")
         else:
-            assert False, f"After {NUM_MINUTES} minutes, the PR did not get all the tool results"
+            raise AssertionError(f"After {NUM_MINUTES} minutes, the PR did not get all the tool results")
 
         # cleanup - delete the branch
         logger.info(f"Deleting the branch {new_branch}")
@@ -91,7 +91,7 @@ def test_e2e_run_github_app():
         # delete the branch
         logger.info(f"Deleting the branch {new_branch}")
         repo.get_git_ref(f"heads/{new_branch}").delete()
-        assert False
+        raise AssertionError() from e
 
 
 if __name__ == '__main__':
