@@ -1,33 +1,61 @@
-import asyncio.locks
 import copy
 import os
-import re
+import time
 import uuid
-from typing import Any, Dict, Tuple
+from typing import Any
 
 import uvicorn
+<<<<<<< HEAD
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from fastapi.staticfiles import StaticFiles
+=======
+from fastapi import APIRouter, HTTPException, Request, Response
+>>>>>>> upstream/main
 from starlette.background import BackgroundTasks
 from starlette.middleware import Middleware
 from starlette_context import context
 from starlette_context.middleware import RawContextMiddleware
 
+<<<<<<< HEAD
 from pr_agent.agent.pr_agent import PRAgent, command2class, unknown_auto_commands
 from pr_agent.algo.utils import update_settings_from_args
+=======
+from pr_agent.agent.pr_agent import PRAgent, prepare_command
+from pr_agent.agent.request_policy import RequestOutcome
+from pr_agent.algo.run_details import command_failed, init_run_details
+from pr_agent.algo.setting_utils import normalize_setting_list
+>>>>>>> upstream/main
 from pr_agent.config_loader import get_settings, global_settings
-from pr_agent.git_providers import (get_git_provider,
-                                    get_git_provider_with_context)
-from pr_agent.git_providers.git_provider import IncrementalPR
+from pr_agent.git_providers import get_git_provider, get_git_provider_with_context
 from pr_agent.git_providers.utils import apply_repo_settings
 from pr_agent.identity_providers import get_identity_provider
 from pr_agent.identity_providers.identity_provider import Eligibility
 from pr_agent.log import LoggingFormat, get_logger, setup_logger
+<<<<<<< HEAD
 from pr_agent.servers import activity_store
 from pr_agent.servers.dashboard import router as dashboard_router
 from pr_agent.servers.utils import DefaultDictWithTimeout, verify_signature
+=======
+from pr_agent.servers.github_common import (
+    _normalise_setting_list,
+    _reformat_quote_ask_command,
+)
+from pr_agent.servers.github_common import handle_line_comments as handle_line_comments
+from pr_agent.servers.github_common import matches_review_state as matches_review_state
+from pr_agent.servers.request_body_limit import create_server_app
+from pr_agent.servers.utils import (
+    DefaultDictWithTimeout,
+    auto_feedback_disabled,
+    get_pr_commands,
+    is_ask_command_comment,
+    push_trigger_slot,
+    shared_should_process_pr_logic,
+    verify_signature,
+)
+from pr_agent.telemetry.prometheus import attach_metrics_endpoint, prometheus_metrics_enabled
+>>>>>>> upstream/main
 
-setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
+setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "INFO"))
 base_path = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 build_number_path = os.path.join(base_path, "build_number.txt")
 if os.path.exists(build_number_path):
@@ -36,6 +64,12 @@ if os.path.exists(build_number_path):
 else:
     build_number = "unknown"
 router = APIRouter()
+_WEBHOOK_DELIVERY_TTL = get_settings().github_app.push_trigger_pending_tasks_ttl
+_completed_webhook_deliveries = DefaultDictWithTimeout(
+    float,
+    ttl=_WEBHOOK_DELIVERY_TTL,
+    update_key_time_on_get=False,
+)
 
 
 @router.post("/api/v1/github_webhooks")
@@ -53,6 +87,7 @@ async def handle_github_webhooks(background_tasks: BackgroundTasks, request: Req
     context["installation_id"] = installation_id
     context["settings"] = copy.deepcopy(global_settings)
     context["git_provider"] = {}
+<<<<<<< HEAD
     event = request.headers.get("X-GitHub-Event", None)
     # Activity log (issue #10). Recorded as a background task so the webhook ack
     # stays immediate — GitHub re-delivers on a slow ack — and added before the
@@ -60,46 +95,72 @@ async def handle_github_webhooks(background_tasks: BackgroundTasks, request: Req
     delivery_id = request.headers.get("X-GitHub-Delivery", None)
     background_tasks.add_task(activity_store.arecord_received, delivery_id, event, body)
     background_tasks.add_task(handle_request, body, event=event, delivery_id=delivery_id)
+=======
+    background_tasks.add_task(
+        handle_request,
+        body,
+        event=request.headers.get("X-GitHub-Event", None),
+        delivery_id=request.headers.get("X-GitHub-Delivery", None),
+    )
+>>>>>>> upstream/main
     return {}
 
 
 @router.post("/api/v1/marketplace_webhooks")
 async def handle_marketplace_webhooks(request: Request, response: Response):
-    body = await get_body(request)
-    get_logger().info(f'Request body:\n{body}')
+    # Marketplace webhooks do not carry the same x-hub-signature-256 header as
+    # PR webhooks, so they bypass the signature check in get_body. The handler
+    # is intentionally a no-op aside from logging: it never publishes comments,
+    # mutates PR state, or triggers AI calls, so a forged request can only
+    # poison logs.
+    try:
+        # Parse the JSON body so a malformed payload returns HTTP 400, but the
+        # handler is a no-op aside from logging - assign to _ to satisfy Ruff
+        # F841 (unused-local) without losing the validation side effect.
+        _ = await request.json()
+    except Exception as e:
+        get_logger().error("Error parsing marketplace request body", artifact={"error": e})
+        raise HTTPException(status_code=400, detail="Error parsing request body") from e
+    get_logger().info("Marketplace request body received")
 
 
 async def get_body(request):
     try:
+        body_bytes = await request.body()
+    except Exception as e:
+        get_logger().error("Error reading request body", artifact={"error": e})
+        raise HTTPException(status_code=400, detail="Error reading request body") from e
+    webhook_secret = getattr(get_settings().github, 'webhook_secret', None)
+    if not webhook_secret:
+        # Refuse unauthenticated webhooks. Silently accepting requests when
+        # the secret is not configured used to allow any internet caller to
+        # trigger expensive AI commands against arbitrary PRs.
+        get_logger().error("Rejecting GitHub webhook: GITHUB.WEBHOOK_SECRET is not configured")
+        raise HTTPException(status_code=403, detail="Webhook secret not configured")
+    signature_header = request.headers.get('x-hub-signature-256', None)
+    verify_signature(body_bytes, webhook_secret, signature_header)
+    try:
         body = await request.json()
     except Exception as e:
-        get_logger().error("Error parsing request body", artifact={'error': e})
+        get_logger().error("Error parsing request body", artifact={"error": e})
         raise HTTPException(status_code=400, detail="Error parsing request body") from e
-    webhook_secret = getattr(get_settings().github, 'webhook_secret', None)
-    if webhook_secret:
-        body_bytes = await request.body()
-        signature_header = request.headers.get('x-hub-signature-256', None)
-        verify_signature(body_bytes, webhook_secret, signature_header)
     return body
 
 
-_duplicate_push_triggers = DefaultDictWithTimeout(ttl=get_settings().github_app.push_trigger_pending_tasks_ttl)
-_pending_task_duplicate_push_conditions = DefaultDictWithTimeout(asyncio.locks.Condition, ttl=get_settings().github_app.push_trigger_pending_tasks_ttl)
-
-async def handle_comments_on_pr(body: Dict[str, Any],
+async def handle_comments_on_pr(body: dict[str, Any],
                                 event: str,
                                 sender: str,
                                 sender_id: str,
                                 action: str,
-                                log_context: Dict[str, Any],
+                                log_context: dict[str, Any],
                                 agent: PRAgent):
     if "comment" not in body:
         return {}
     comment_body = body.get("comment", {}).get("body")
     if comment_body and isinstance(comment_body, str) and not comment_body.lstrip().startswith("/"):
-        if '/ask' in comment_body and comment_body.strip().startswith('> ![image]'):
-            comment_body_split = comment_body.split('/ask')
-            comment_body = '/ask' + comment_body_split[1] +' \n' +comment_body_split[0].strip().lstrip('>')
+        reformatted = _reformat_quote_ask_command(comment_body) if '/ask' in comment_body else None
+        if reformatted is not None:
+            comment_body = reformatted
             get_logger().info(f"Reformatting comment_body so command is at the beginning: {comment_body}")
         else:
             get_logger().info("Ignoring comment not starting with /")
@@ -110,7 +171,7 @@ async def handle_comments_on_pr(body: Dict[str, Any],
     elif "comment" in body and "pull_request_url" in body["comment"]:
         api_url = body["comment"]["pull_request_url"]
         try:
-            if ('/ask' in comment_body and
+            if (is_ask_command_comment(comment_body) and
                     'subject_type' in body["comment"] and body["comment"]["subject_type"] == "line"):
                 # comment on a code line in the "files changed" tab
                 comment_body = handle_line_comments(body, comment_body)
@@ -122,51 +183,162 @@ async def handle_comments_on_pr(body: Dict[str, Any],
     log_context["api_url"] = api_url
     comment_id = body.get("comment", {}).get("id")
     provider = get_git_provider_with_context(pr_url=api_url)
+    if isinstance(sender, str) and sender and hasattr(provider, "set_command_actor"):
+        provider.set_command_actor(sender)
     with get_logger().contextualize(**log_context):
         if get_identity_provider().verify_eligibility("github", sender_id, api_url) is not Eligibility.NOT_ELIGIBLE:
             get_logger().info(f"Processing comment on PR {api_url=}, comment_body={comment_body}")
-            await agent.handle_request(api_url, comment_body,
-                        notify=lambda: provider.add_eyes_reaction(comment_id, disable_eyes=disable_eyes))
+            succeeded = await agent.handle_request(
+                api_url, comment_body,
+                notify=lambda: provider.add_eyes_reaction(comment_id, disable_eyes=disable_eyes),
+                # Preserve compatibility mode while exposing failures to outcome reactions.
+                propagate_tool_errors=True)
+            # Optional, and disabled by default: tell the author how the command ended without
+            # adding another comment to the thread.
+            if succeeded is RequestOutcome.SKIPPED:
+                return RequestOutcome.SKIPPED
+            provider.react_to_outcome(comment_id, bool(succeeded))
+            return succeeded
         else:
             get_logger().info(f"User {sender=} is not eligible to process comment on PR {api_url=}")
 
-async def handle_new_pr_opened(body: Dict[str, Any],
+async def handle_new_pr_opened(body: dict[str, Any],
                                event: str,
                                sender: str,
                                sender_id: str,
                                action: str,
-                               log_context: Dict[str, Any],
+                               log_context: dict[str, Any],
                                agent: PRAgent):
-    title = body.get("pull_request", {}).get("title", "")
 
     pull_request, api_url = _check_pull_request_event(action, body, log_context)
     if not (pull_request and api_url):
         get_logger().info(f"Invalid PR event: {action=} {api_url=}")
         return {}
-    if action in get_settings().github_app.handle_pr_actions:  # ['opened', 'reopened', 'ready_for_review']
+    if action in normalize_setting_list(get_settings().github_app.handle_pr_actions, split_commas=True):
         # logic to ignore PRs with specific titles (e.g. "[Auto] ...")
         apply_repo_settings(api_url)
         if get_identity_provider().verify_eligibility("github", sender_id, api_url) is not Eligibility.NOT_ELIGIBLE:
-            await _perform_auto_commands_github("pr_commands", agent, body, api_url, log_context)
+            return await _perform_auto_commands_github("pr_commands", agent, body, api_url, log_context)
         else:
             get_logger().info(f"User {sender=} is not eligible to process PR {api_url=}")
 
-async def handle_push_trigger_for_new_commits(body: Dict[str, Any],
+
+# The check run each automatic command publishes its output to when `github.publish_as_check_run`
+# is on, keyed by command and valued by the `name` the tool passes to `_publish_check_run`.
+_AUTO_COMMAND_CHECK_RUNS = {"describe": "describe", "review": "review", "improve": "suggestions"}
+
+
+def _check_run_provider(api_url: str):
+    """The provider whose check runs the automatic commands complete, or None when they publish none."""
+    if not get_settings().get("github.publish_as_check_run", False):
+        return None
+    try:
+        provider = get_git_provider_with_context(pr_url=api_url)
+    except Exception as e:
+        get_logger().warning(f"Cannot open check runs for {api_url=}: {e}")
+        return None
+    return provider if callable(getattr(provider, "start_check_run", None)) else None
+
+
+def _auto_command_check_run(command) -> tuple[str, str | None]:
+    """The command's leading token and the check run its tool publishes to, if any."""
+    tokens = command if isinstance(command, list) else str(command).split()
+    action = tokens[0] if tokens else ""
+    return action, _AUTO_COMMAND_CHECK_RUNS.get(action.lstrip("/").lower())
+
+
+def _start_auto_command_check_run(provider, command) -> str | None:
+    """Open the command's check run as in_progress: the first sign the pull request was picked up."""
+    action, name = _auto_command_check_run(command)
+    if provider is None or name is None:
+        return None
+    try:
+        provider.start_check_run(name, f"PR-Agent is running {action}")
+    except Exception as e:
+        get_logger().warning(f"Failed to open the {name} check run: {e}")
+    return name
+
+
+def _finish_auto_command_check_run(provider, name: str | None, command, succeeded: bool) -> None:
+    """Complete the command's check run when its tool did not, so it cannot stay in_progress."""
+    if provider is None or name is None:
+        return
+    action, _ = _auto_command_check_run(command)
+    summary = f"PR-Agent ran {action}" if succeeded else f"PR-Agent could not finish {action}"
+    try:
+        provider.finish_check_run(name, "success" if succeeded else "failure", summary)
+    except Exception as e:
+        get_logger().warning(f"Failed to complete the {name} check run: {e}")
+
+
+async def handle_pull_request_review_submitted(body: dict[str, Any],
+                                               event: str,
+                                               sender: str,
+                                               sender_id: str,
+                                               sender_type: str,
+                                               action: str,
+                                               log_context: dict[str, Any],
+                                               agent: PRAgent):
+    pull_request, api_url = _check_pull_request_event(action, body, log_context)
+    if not (pull_request and api_url):
+        get_logger().info(f"Invalid PR review event: {action=} {api_url=}")
+        return {}
+    if sender_type == "Bot":
+        get_logger().info(f"Skipping pull_request_review from bot sender: {sender=}")
+        return {}
+
+    apply_repo_settings(api_url)
+    review = body.get("review", {})
+    review_state = review.get("state", "") if isinstance(review, dict) else ""
+    review_author_type = ""
+    if isinstance(review, dict):
+        review_author = review.get("user", {})
+        if isinstance(review_author, dict):
+            review_author_type = str(review_author.get("type", "")).strip().lower()
+    review_author_types = {
+        str(author_type).strip().lower()
+        for author_type in _normalise_setting_list(
+            get_settings().get("GITHUB_APP.REVIEW_AUTHOR_TYPES", ["User"])
+        )
+        if str(author_type).strip()
+    }
+    if review_author_type not in review_author_types:
+        get_logger().info(
+            f"Skipping review submission from {review_author_type=}: author type is not configured"
+        )
+        return {}
+    if not matches_review_state(
+        review_state, get_settings().get("GITHUB_APP.REVIEW_STATES", ["changes_requested"])
+    ):
+        get_logger().info(f"Skipping review submission with {review_state=}: state is not configured")
+        return {}
+
+    if get_identity_provider().verify_eligibility("github", sender_id, api_url) is not Eligibility.NOT_ELIGIBLE:
+        return await _perform_auto_commands_github("review_commands", agent, body, api_url, log_context)
+    else:
+        get_logger().info(f"User {sender=} is not eligible to process review on PR {api_url=}")
+
+
+async def handle_push_trigger_for_new_commits(body: dict[str, Any],
                         event: str,
                         sender: str,
                         sender_id: str,
                         action: str,
-                        log_context: Dict[str, Any],
+                        log_context: dict[str, Any],
                         agent: PRAgent):
     pull_request, api_url = _check_pull_request_event(action, body, log_context)
     if not (pull_request and api_url):
         return {}
 
-    apply_repo_settings(api_url) # we need to apply the repo settings to get the correct settings for the PR. This is quite expensive - a call to the git provider is made for each PR event.
+    # we need to apply the repo settings to get the correct settings for the PR.
+    # This is quite expensive - a call to the git provider is made for each PR event.
+    apply_repo_settings(api_url)
     if not get_settings().github_app.handle_push_trigger:
         return {}
+    if get_settings().github_app.push_trigger_ignore_bot_commits and body.get("sender", {}).get("type") == "Bot":
+        get_logger().info(f"Skipping {event}: bot commit detected")
+        return {}
 
-    # TODO: do we still want to get the list of commits to filter bot/merge commits?
     before_sha = body.get("before")
     after_sha = body.get("after")
     merge_commit_sha = pull_request.get("merge_commit_sha")
@@ -175,44 +347,16 @@ async def handle_push_trigger_for_new_commits(body: Dict[str, Any],
     if get_settings().github_app.push_trigger_ignore_merge_commits and after_sha == merge_commit_sha:
         return {}
 
-    # Prevent triggering multiple times for subsequent push triggers when one is enough:
-    # The first push will trigger the processing, and if there's a second push in the meanwhile it will wait.
-    # Any more events will be discarded, because they will all trigger the exact same processing on the PR.
-    # We let the second event wait instead of discarding it because while the first event was being processed,
-    # more commits may have been pushed that led to the subsequent events,
-    # so we keep just one waiting as a delegate to trigger the processing for the new commits when done waiting.
-    current_active_tasks = _duplicate_push_triggers.setdefault(api_url, 0)
-    max_active_tasks = 2 if get_settings().github_app.push_trigger_pending_tasks_backlog else 1
-    if current_active_tasks < max_active_tasks:
-        # first task can enter, and second tasks too if backlog is enabled
-        get_logger().info(
-            f"Continue processing push trigger for {api_url=} because there are {current_active_tasks} active tasks"
-        )
-        _duplicate_push_triggers[api_url] += 1
-    else:
-        get_logger().info(
-            f"Skipping push trigger for {api_url=} because another event already triggered the same processing"
-        )
-        return {}
-    async with _pending_task_duplicate_push_conditions[api_url]:
-        if current_active_tasks == 1:
-            # second task waits
-            get_logger().info(
-                f"Waiting to process push trigger for {api_url=} because the first task is still in progress"
-            )
-            await _pending_task_duplicate_push_conditions[api_url].wait()
-            get_logger().info(f"Finished waiting to process push trigger for {api_url=} - continue with flow")
-
-    try:
+    async with push_trigger_slot(
+        api_url,
+        allow_backlog=get_settings().github_app.push_trigger_pending_tasks_backlog,
+        ttl=get_settings().github_app.push_trigger_pending_tasks_ttl,
+    ) as proceed:
+        if not proceed:
+            return {}
         if get_identity_provider().verify_eligibility("github", sender_id, api_url) is not Eligibility.NOT_ELIGIBLE:
             get_logger().info(f"Performing incremental review for {api_url=} because of {event=} and {action=}")
-            await _perform_auto_commands_github("push_commands", agent, body, api_url, log_context)
-
-    finally:
-        # release the waiting task block
-        async with _pending_task_duplicate_push_conditions[api_url]:
-            _pending_task_duplicate_push_conditions[api_url].notify(1)
-            _duplicate_push_triggers[api_url] -= 1
+            return await _perform_auto_commands_github("push_commands", agent, body, api_url, log_context)
 
 
 def handle_closed_pr(body, event, action, log_context):
@@ -242,7 +386,7 @@ def get_log_context(body, event, action, build_number):
                        "request_id": uuid.uuid4().hex, "build_number": build_number, "app_name": app_name,
                         "repo": repo, "git_org": git_org, "installation_id": installation_id}
     except Exception as e:
-        get_logger().error(f"Failed to get log context", artifact={'error': e})
+        get_logger().error("Failed to get log context", artifact={'error': e})
         log_context = {}
     return log_context, sender, sender_id, sender_type
 
@@ -250,8 +394,16 @@ def get_log_context(body, event, action, build_number):
 def is_bot_user(sender, sender_type):
     try:
         # logic to ignore PRs opened by bot
+<<<<<<< HEAD
         if get_settings().get("GITHUB_APP.IGNORE_BOT_PR", False) and sender_type == "Bot":
             if 'dvmn-agent' not in sender:
+=======
+        ignore_bot_pr = get_settings().get("GITHUB_APP.IGNORE_BOT_PR", None)
+        if ignore_bot_pr is None:
+            ignore_bot_pr = get_settings().get("GITHUB.IGNORE_BOT_PR", False)
+        if ignore_bot_pr and sender_type == "Bot":
+            if 'pr-agent' not in sender:
+>>>>>>> upstream/main
                 get_logger().info(f"Ignoring PR from '{sender=}' because it is a bot")
             return True
     except Exception as e:
@@ -260,64 +412,10 @@ def is_bot_user(sender, sender_type):
 
 
 def should_process_pr_logic(body) -> bool:
-    try:
-        pull_request = body.get("pull_request", {})
-        title = pull_request.get("title", "")
-        pr_labels = pull_request.get("labels", [])
-        source_branch = pull_request.get("head", {}).get("ref", "")
-        target_branch = pull_request.get("base", {}).get("ref", "")
-        sender = body.get("sender", {}).get("login")
-        repo_full_name = body.get("repository", {}).get("full_name", "")
-
-        # logic to ignore PRs from specific repositories
-        ignore_repos = get_settings().get("CONFIG.IGNORE_REPOSITORIES", [])
-        if ignore_repos and repo_full_name:
-            if any(re.search(regex, repo_full_name) for regex in ignore_repos):
-                get_logger().info(f"Ignoring PR from repository '{repo_full_name}' due to 'config.ignore_repositories' setting")
-                return False
-
-        # logic to ignore PRs from specific users
-        ignore_pr_users = get_settings().get("CONFIG.IGNORE_PR_AUTHORS", [])
-        if ignore_pr_users and sender:
-            if any(re.search(regex, sender) for regex in ignore_pr_users):
-                get_logger().info(f"Ignoring PR from user '{sender}' due to 'config.ignore_pr_authors' setting")
-                return False
-
-        # logic to ignore PRs with specific titles
-        if title:
-            ignore_pr_title_re = get_settings().get("CONFIG.IGNORE_PR_TITLE", [])
-            if not isinstance(ignore_pr_title_re, list):
-                ignore_pr_title_re = [ignore_pr_title_re]
-            if ignore_pr_title_re and any(re.search(regex, title) for regex in ignore_pr_title_re):
-                get_logger().info(f"Ignoring PR with title '{title}' due to config.ignore_pr_title setting")
-                return False
-
-        # logic to ignore PRs with specific labels or source branches or target branches.
-        ignore_pr_labels = get_settings().get("CONFIG.IGNORE_PR_LABELS", [])
-        if pr_labels and ignore_pr_labels:
-            labels = [label['name'] for label in pr_labels]
-            if any(label in ignore_pr_labels for label in labels):
-                labels_str = ", ".join(labels)
-                get_logger().info(f"Ignoring PR with labels '{labels_str}' due to config.ignore_pr_labels settings")
-                return False
-
-        # logic to ignore PRs with specific source or target branches
-        ignore_pr_source_branches = get_settings().get("CONFIG.IGNORE_PR_SOURCE_BRANCHES", [])
-        ignore_pr_target_branches = get_settings().get("CONFIG.IGNORE_PR_TARGET_BRANCHES", [])
-        if pull_request and (ignore_pr_source_branches or ignore_pr_target_branches):
-            if any(re.search(regex, source_branch) for regex in ignore_pr_source_branches):
-                get_logger().info(
-                    f"Ignoring PR with source branch '{source_branch}' due to config.ignore_pr_source_branches settings")
-                return False
-            if any(re.search(regex, target_branch) for regex in ignore_pr_target_branches):
-                get_logger().info(
-                    f"Ignoring PR with target branch '{target_branch}' due to config.ignore_pr_target_branches settings")
-                return False
-    except Exception as e:
-        get_logger().error(f"Failed 'should_process_pr_logic': {e}")
-    return True
+    return shared_should_process_pr_logic(body, provider="github")
 
 
+<<<<<<< HEAD
 async def handle_request(body: Dict[str, Any], event: str, delivery_id: str = None):
     """
     Handle incoming GitHub webhook requests.
@@ -335,11 +433,16 @@ async def handle_request(body: Dict[str, Any], event: str, delivery_id: str = No
         await activity_store.amark_outcome(
             delivery_id, activity_store.STATUS_IGNORED, activity_store.REASON_NO_ACTION)
         return {}
+=======
+async def _dispatch_request(body: dict[str, Any], event: str, action: str):
+    """Return False when a command fails, preserving ignored events as completed work."""
+>>>>>>> upstream/main
     agent = PRAgent()
     log_context, sender, sender_id, sender_type = get_log_context(body, event, action, build_number)
 
     # logic to ignore PRs opened by bot, PRs with specific titles, labels, source branches, or target branches
     if is_bot_user(sender, sender_type) and 'check_run' not in body:
+<<<<<<< HEAD
         get_logger().debug(f"Request ignored: bot user detected")
         await activity_store.amark_outcome(
             delivery_id, activity_store.STATUS_IGNORED, activity_store.REASON_BOT_USER)
@@ -382,27 +485,78 @@ async def handle_request(body: Dict[str, Any], event: str, delivery_id: str = No
             delivery_id, activity_store.STATUS_FAILED, reason=str(e)[:500])
         raise
     await activity_store.amark_outcome(delivery_id, activity_store.STATUS_COMPLETED)
+=======
+        get_logger().debug("Request ignored: bot user detected")
+        return {}
+    if action != 'created' and 'check_run' not in body:
+        if not should_process_pr_logic(body):
+            get_logger().debug("Request ignored: PR logic filtering")
+            return {}
+
+    if 'check_run' in body:  # handle failed checks
+        # get_logger().debug(f'Request body', artifact=body, event=event) # added inside handle_checks
+        pass
+    # handle submitted pull request reviews
+    elif event == 'pull_request_review' and action == 'submitted':
+        get_logger().debug('Request body', artifact=body, event=event)
+        return await handle_pull_request_review_submitted(
+            body, event, sender, sender_id, sender_type, action, log_context, agent
+        )
+    # handle comments on PRs
+    elif action == 'created':
+        get_logger().debug('Request body', artifact=body, event=event)
+        return await handle_comments_on_pr(body, event, sender, sender_id, action, log_context, agent)
+    # handle new PRs
+    elif event == 'pull_request' and action != 'synchronize' and action != 'closed':
+        get_logger().debug('Request body', artifact=body, event=event)
+        return await handle_new_pr_opened(body, event, sender, sender_id, action, log_context, agent)
+    elif event == "issue_comment" and 'edited' in action:
+        pass # handle_checkbox_clicked
+    # handle pull_request event with synchronize action - "push trigger" for new commits
+    elif event == 'pull_request' and action == 'synchronize':
+        return await handle_push_trigger_for_new_commits(body, event, sender,sender_id,  action, log_context, agent)
+    elif event == 'pull_request' and action == 'closed':
+        if get_settings().get("CONFIG.ANALYTICS_FOLDER", ""):
+            handle_closed_pr(body, event, action, log_context)
+    else:
+        get_logger().info(f"event {event=} action {action=} does not require any handling")
+>>>>>>> upstream/main
     return {}
 
 
-def handle_line_comments(body: Dict, comment_body: [str, Any]) -> str:
-    if not comment_body:
-        return ""
-    start_line = body["comment"]["start_line"]
-    end_line = body["comment"]["line"]
-    start_line = end_line if not start_line else start_line
-    question = comment_body.replace('/ask', '').strip()
-    diff_hunk = body["comment"]["diff_hunk"]
-    get_settings().set("ask_diff_hunk", diff_hunk)
-    path = body["comment"]["path"]
-    side = body["comment"]["side"]
-    comment_id = body["comment"]["id"]
-    if '/ask' in comment_body:
-        comment_body = f"/ask_line --line_start={start_line} --line_end={end_line} --side={side} --file_name={path} --comment_id={comment_id} {question}"
-    return comment_body
+async def handle_request(body: dict[str, Any], event: str, delivery_id: str | None = None):
+    """
+    Handle incoming GitHub webhook requests.
+
+    Args:
+        body: The request body.
+        event: The GitHub event type (e.g. "pull_request", "issue_comment", etc.).
+        delivery_id: GitHub's stable identifier for this webhook delivery and its redeliveries.
+    """
+    action = body.get("action") # "created", "opened", "reopened", "ready_for_review", "review_requested", "synchronize"
+    get_logger().debug(f"Handling request with event: {event}, action: {action}")
+    if not action:
+        get_logger().debug("No action found in request body, exiting handle_request")
+        return {}
+    settings = get_settings()
+    if not delivery_id or not settings.get("GITHUB_APP.WEBHOOK_DELIVERY_DEDUPLICATION", False):
+        await _dispatch_request(body, event, action)
+        return {}
+
+    async with push_trigger_slot(
+        f"github-webhook-delivery:{delivery_id}",
+        allow_backlog=False,
+        ttl=_WEBHOOK_DELIVERY_TTL,
+    ) as proceed:
+        if not proceed or _completed_webhook_deliveries[delivery_id] > time.monotonic():
+            return {}
+        succeeded = await _dispatch_request(body, event, action)
+        if succeeded is not False:
+            _completed_webhook_deliveries[delivery_id] = time.monotonic() + _WEBHOOK_DELIVERY_TTL
+    return {}
 
 
-def _check_pull_request_event(action: str, body: dict, log_context: dict) -> Tuple[Dict[str, Any], str]:
+def _check_pull_request_event(action: str, body: dict, log_context: dict) -> tuple[dict[str, Any], str]:
     invalid_result = {}, ""
     pull_request = body.get("pull_request")
     if not pull_request:
@@ -411,9 +565,10 @@ def _check_pull_request_event(action: str, body: dict, log_context: dict) -> Tup
     if not api_url:
         return invalid_result
     log_context["api_url"] = api_url
-    if pull_request.get("draft", True) or pull_request.get("state") != "open":
+    if pull_request.get("state") != "open":
         return invalid_result
-    if action in ("review_requested", "synchronize") and pull_request.get("created_at") == pull_request.get("updated_at"):
+    if (action in ("review_requested", "synchronize")
+            and pull_request.get("created_at") == pull_request.get("updated_at")):
         # avoid double reviews when opening a PR for the first time
         return invalid_result
     return pull_request, api_url
@@ -421,15 +576,27 @@ def _check_pull_request_event(action: str, body: dict, log_context: dict) -> Tup
 
 async def _perform_auto_commands_github(commands_conf: str, agent: PRAgent, body: dict, api_url: str,
                                         log_context: dict):
-    apply_repo_settings(api_url)
-    if commands_conf == "pr_commands" and get_settings().config.disable_auto_feedback:  # auto commands for PR, and auto feedback is disabled
+    feedback_on_draft = get_settings().github_app.feedback_on_draft_pr
+    if commands_conf == "pr_commands" and body.get("action") == "ready_for_review" and feedback_on_draft:
+        get_logger().info(f"Skipping draft-ready commands because draft feedback is enabled: {api_url}")
+        return
+    is_draft = body.get("pull_request", {}).get("draft", True)
+    if is_draft and not feedback_on_draft:
+        get_logger().info(f"Skipping draft PR {api_url=}")
+        return
+    if auto_feedback_disabled():
+        # auto commands, and auto feedback is disabled
         get_logger().info(f"Auto feedback is disabled, skipping auto commands for PR {api_url=}")
         return
     if not should_process_pr_logic(body): # Here we already updated the configuration with the repo settings
         return {}
-    commands = get_settings().get(f"github_app.{commands_conf}")
+    commands = (
+        get_pr_commands("github_app")
+        if commands_conf == "pr_commands"
+        else normalize_setting_list(get_settings().get(f"github_app.{commands_conf}"))
+    )
     if not commands:
-        get_logger().info(f"New PR, but no auto commands configured")
+        get_logger().info(f"No {commands_conf} configured, skipping auto commands")
         return
     unknown = unknown_auto_commands(commands)
     if unknown:
@@ -438,14 +605,45 @@ async def _perform_auto_commands_github(commands_conf: str, agent: PRAgent, body
             f"Fix the configuration — known commands: {sorted(command2class.keys())}"
         )
     get_settings().set("config.is_auto_command", True)
+    provider = _check_run_provider(api_url)
+    try:
+        command_provider = get_git_provider_with_context(pr_url=api_url)
+    except Exception as e:
+        get_logger().warning(f"Cannot access the GitHub provider for cache reset, {api_url=}: {e}")
+        command_provider = None
+    succeeded = True
     for command in commands:
-        split_command = command.split(" ")
-        command = split_command[0]
-        args = split_command[1:]
-        other_args = update_settings_from_args(args)
-        new_command = ' '.join([command] + other_args)
-        get_logger().info(f"{commands_conf}. Performing auto command '{new_command}', for {api_url=}")
-        await agent.handle_request(api_url, new_command)
+        check_run = None
+        command_succeeded = True
+        try:
+            reset_diff_cache = getattr(command_provider, "reset_diff_cache_for_command", None)
+            if callable(reset_diff_cache):
+                reset_diff_cache()
+            new_command = prepare_command(command)
+            get_logger().info(f"{commands_conf}. Performing auto command '{new_command}', for {api_url=}")
+            def notify_start(new_command=new_command):
+                nonlocal check_run
+                check_run = _start_auto_command_check_run(provider, new_command)
+            # Install a fresh collector so `command_failed()` below cannot read a verdict left
+            # behind by the previous command; the tool replaces it with its own on entry.
+            init_run_details()
+            result = await agent.handle_request(api_url, new_command, notify=notify_start)
+            if result is RequestOutcome.SKIPPED:
+                return RequestOutcome.SKIPPED
+            if result is False:
+                command_succeeded = False
+            elif command_failed():
+                # `propagate_tool_errors` is false by default, so a tool that failed internally
+                # still returns normally. Reporting that as success would put a green tick on a
+                # pull request that never got its review.
+                get_logger().warning(f"Command '{command}' reported success but recorded a failure")
+                command_succeeded = False
+        except Exception as e:
+            command_succeeded = False
+            get_logger().error(f"Failed to perform command {command}: {e}")
+        _finish_auto_command_check_run(provider, check_run, command, command_succeeded)
+        succeeded = succeeded and command_succeeded
+    return succeeded
 
 
 @router.get("/")
@@ -458,7 +656,9 @@ if get_settings().github_app.override_deployment_type:
     get_settings().set("GITHUB.DEPLOYMENT_TYPE", "app")
 # get_settings().set("CONFIG.PUBLISH_OUTPUT_PROGRESS", False)
 middleware = [Middleware(RawContextMiddleware)]
-app = FastAPI(middleware=middleware)
+if prometheus_metrics_enabled():
+    attach_metrics_endpoint(router)
+app = create_server_app(middleware=middleware)
 app.include_router(router)
 app.include_router(dashboard_router)
 def _mount_public_assets(app: FastAPI) -> None:
