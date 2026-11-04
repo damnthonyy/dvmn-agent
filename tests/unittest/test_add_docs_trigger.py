@@ -19,6 +19,7 @@ from pr_agent.tools.pr_add_docs import PRAddDocs
     ],
 )
 async def test_add_docs_trigger(monkeypatch, action, draft, state, should_run):
+    monkeypatch.setattr("pr_agent.agent.pr_agent.enforce_request_policy", lambda _url: None)
     # Mock settings to enable the "/add_docs" auto-command on PR opened
     settings = get_settings()
     settings.github_app.pr_commands = ["/add_docs"]
@@ -45,8 +46,8 @@ async def test_add_docs_trigger(monkeypatch, action, draft, state, should_run):
         lambda pr_url: FakeGitProvider(pr_url),
     )
     monkeypatch.setattr(
-        "pr_agent.tools.pr_add_docs.get_git_provider",
-        lambda: FakeGitProvider,
+        "pr_agent.tools.pr_add_docs.get_git_provider_for_tool",
+        lambda pr_url: FakeGitProvider(pr_url),
     )
 
     # Ensure identity provider always eligible
