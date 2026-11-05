@@ -59,3 +59,74 @@ class TestAzureDevopsProviderPublishComment(unittest.TestCase):
         status = get_settings().azure_devops.default_comment_status
         # The expected value should match what's in your configuration.toml
         self.assertEqual(status, "closed")
+<<<<<<< HEAD
+=======
+
+
+class TestAzureDevopsProviderCommitUrl(unittest.TestCase):
+    def test_get_latest_commit_url_cache_preserves_encoding_and_resets(self):
+        # workspace/repo slugs are stored decoded for the REST API; the web URL must
+        # re-encode them so project/repo names with spaces don't emit raw spaces
+        with patch.object(AzureDevopsProvider, "_get_azure_devops_client", return_value=(MagicMock(), MagicMock())):
+            provider = AzureDevopsProvider()
+            provider.workspace_slug = "Dev Project"
+            provider.repo_slug = "repo name"
+            provider.pr_num = 1234
+
+            client = provider.azure_devops_client
+            client.normalized_url = "https://dev.azure.com/org"
+            commit = MagicMock()
+            commit.commit_id = "abc123"
+            client.get_pull_request_commits.return_value = [commit]
+
+            url = provider.get_latest_commit_url()
+
+            assert url == "https://dev.azure.com/org/Dev%20Project/_git/repo%20name/commit/abc123"
+            assert " " not in url
+            assert provider.get_latest_commit_url() == url
+            client.get_pull_request_commits.assert_called_once_with("repo name", 1234, "Dev Project")
+
+            commit.commit_id = "def456"
+            provider.reset_diff_cache_for_command()
+            assert provider.get_latest_commit_url().endswith("/def456")
+            assert client.get_pull_request_commits.call_count == 2
+
+            provider.set_pr("https://dev.azure.com/org/Other%20Project/_git/other%20repo/pullrequest/2")
+            assert provider.get_latest_commit_url() == (
+                "https://dev.azure.com/org/Other%20Project/_git/other%20repo/commit/def456"
+            )
+            assert client.get_pull_request_commits.call_count == 3
+
+    def test_get_latest_commit_url_empty_commit_list(self):
+        # a PR force-pushed back onto its base has zero commits; the provider must not
+        # index an empty list, and should fall back to the base-class empty-string contract
+        with patch.object(AzureDevopsProvider, "_get_azure_devops_client", return_value=(MagicMock(), MagicMock())):
+            provider = AzureDevopsProvider()
+            provider.workspace_slug = "ws"
+            provider.repo_slug = "repo"
+            provider.pr_num = 1234
+
+            client = provider.azure_devops_client
+            client.normalized_url = "https://dev.azure.com/org"
+            client.get_pull_request_commits.side_effect = [[], [MagicMock(commit_id="abc123")]]
+
+            assert provider.get_latest_commit_url() == ""
+            assert provider.get_latest_commit_url() == "https://dev.azure.com/org/ws/_git/repo/commit/abc123"
+            assert provider.get_latest_commit_url().endswith("/abc123")
+            assert client.get_pull_request_commits.call_count == 2
+
+    def test_latest_commit_url_does_not_cache_failures(self):
+        with patch.object(AzureDevopsProvider, "_get_azure_devops_client", return_value=(MagicMock(), MagicMock())):
+            provider = AzureDevopsProvider("https://dev.azure.com/org/project/_git/repo/pullrequest/1")
+            client = provider.azure_devops_client
+            client.normalized_url = "https://dev.azure.com/org"
+            client.get_pull_request_commits.side_effect = [
+                ConnectionError("unavailable"), [MagicMock(commit_id="abc123")]
+            ]
+
+            with self.assertRaisesRegex(ConnectionError, "unavailable"):
+                provider.get_latest_commit_url()
+            assert provider.get_latest_commit_url() == "https://dev.azure.com/org/project/_git/repo/commit/abc123"
+            assert provider.get_latest_commit_url().endswith("/abc123")
+            assert client.get_pull_request_commits.call_count == 2
+>>>>>>> upstream/main
