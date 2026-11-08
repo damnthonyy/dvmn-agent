@@ -1,4 +1,9 @@
-`Supported Git Platforms: GitHub, GitLab, Bitbucket`
+---
+title: "Self-Reflection"
+sidebar_position: 7
+---
+
+`Supported Git Platforms: GitHub, GitLab, Bitbucket, Azure DevOps, Gitea`
 
 PR-Agent implements a **self-reflection** process where the AI model reflects, scores, and re-ranks its own suggestions, eliminating irrelevant or incorrect ones.
 This approach improves the quality and relevance of suggestions, saving users time and enhancing their experience.
@@ -14,8 +19,9 @@ To achieve this goal, PR-Agent offers a dedicated hierarchical structure when pr
 - Each suggestion is first described by a one-line summary, which can be expanded to a full description by clicking on a collapsible.
 - Upon expanding a suggestion, the user receives a more comprehensive description, and a code snippet demonstrating the recommendation.
 
-!!! note "Fast Review"
-    This hierarchical structure is designed to facilitate rapid review of each suggestion, with users spending an average of ~5-10 seconds per item.
+:::note[Fast Review]
+This hierarchical structure is designed to facilitate rapid review of each suggestion, with users spending an average of ~5-10 seconds per item.
+:::
 
 ## Self-reflection and Re-ranking
 
@@ -36,14 +42,24 @@ Note that presenting all generated suggestions simultaneously provides the model
 To conclude, the self-reflection process enables PR-Agent to prioritize suggestions based on their importance, eliminate inaccurate or irrelevant proposals, and optionally exclude suggestions that fall below a specified threshold of significance.
 This results in a more refined and valuable set of suggestions for the user, saving time and improving the overall experience.
 
+## Handling Unusable Feedback
+
+For `/improve`, an empty response or unusable feedback advances to the next configured reflection model,
+subject to the existing model order and deployment restrictions. Only reflection is retried; the initial
+suggestions are reused. These retries can add latency and model usage.
+
+Valid zero-score rejections do not cause a retry, and partly usable feedback is handled per suggestion.
+If every attempt fails, `pr_code_suggestions.score_on_reflection_failure` applies. The existing score and
+line-range filters still determine whether a suggestion can be published.
+
 ## Example Results
 
-![self_reflection](https://codium.ai/images/pr_agent/self_reflection1.png){width=768}
-![self_reflection](https://codium.ai/images/pr_agent/self_reflection2.png){width=768}
+<img src="/img/self_reflection1.png" alt="self_reflection" width="768" />
+<img src="/img/self_reflection2.png" alt="self_reflection" width="768" />
 
 ## Appendix - Relevant Configuration Options
 
 ```toml
 [pr_code_suggestions]
-suggestions_score_threshold = 0 # Filter out suggestions with a score below this threshold (0-10)
+suggestions_score_threshold = 1 # Filter out suggestions with a score below this threshold (0-10); 0 is treated as 1
 ```
