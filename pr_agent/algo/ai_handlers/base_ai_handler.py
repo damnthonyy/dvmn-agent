@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
 
+from pr_agent.algo.instruction_context import append_protected_system_instructions
+
 
 class BaseAiHandler(ABC):
     """
@@ -14,6 +16,21 @@ class BaseAiHandler(ABC):
     @abstractmethod
     def deployment_id(self):
         pass
+
+    def build_request_messages(
+        self,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        image_path: str | None = None,
+    ) -> list[dict]:
+        """Build the text-only message payload dispatched by the base handler contract."""
+        system_prompt = append_protected_system_instructions(system_prompt)
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
     @abstractmethod
     async def chat_completion(self, model: str, system: str, user: str, temperature: float = 0.2, img_path: str = None):
