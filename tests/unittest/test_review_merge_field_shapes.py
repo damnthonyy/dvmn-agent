@@ -1,0 +1,118 @@
+"""Merging chunked reviews must render the same shapes the single-call review accepts.
+
+`security_concerns` is declared as a string, but a model enumerating several findings answers
+with a list; `convert_to_markdown_v2` has rendered that since #2899. The chunk merger still
+stringified the value, so a chunked review printed a Python list repr into the PR.
+"""
+import pytest
+
+from pr_agent.algo.review_merge import merge_review_chunks
+from pr_agent.algo.utils import is_value_no
+
+
+def _merged(*chunk_values, field="security_concerns"):
+    return merge_review_chunks([{"review": {field: value}} for value in chunk_values])["review"][field]
+
+
+def test_a_list_from_one_chunk_is_rendered_as_text():
+    merged = _merged(["SQL injection in the query builder"], "No")
+
+    assert "SQL injection in the query builder" in merged
+    assert "['" not in merged and "']" not in merged
+
+
+def test_entries_from_several_chunks_are_unioned():
+    merged = _merged(["SQL injection in the query builder"], ["Missing CSRF token"])
+
+    assert "SQL injection in the query builder" in merged
+    assert "Missing CSRF token" in merged
+    assert "['" not in merged
+
+
+def test_a_multi_entry_list_becomes_bullets():
+    merged = _merged(["First concern", "Second concern"], "No")
+
+    assert "- First concern" in merged
+    assert "- Second concern" in merged
+
+
+def test_a_mapping_is_rendered_as_text():
+    merged = _merged({"auth": "token logged in plaintext"}, "No")
+
+    assert "token logged in plaintext" in merged
+    assert "{'" not in merged
+
+
+@pytest.mark.parametrize("chunks", [
+    (["No"], "No"),
+    (["No"], ["No"]),
+    ("No", "No"),
+    ([], ""),
+    ([None], None),
+])
+def test_nothing_reported_merges_to_a_value_the_renderer_suppresses(chunks):
+    """`is_value_no` only recognises a string, so the merged value must be one."""
+    merged = _merged(*chunks)
+
+    assert is_value_no(merged), f"the review would render a concern reading {merged!r}"
+
+
+def test_plain_strings_are_unchanged():
+    """Control: the shape the prompt asks for keeps its exact behaviour."""
+    assert _merged("SQL injection", "No") == "SQL injection"
+    assert _merged("No", "No") == "No"
+
+
+def test_two_different_strings_are_still_unioned():
+    merged = _merged("First concern", "Second concern")
+
+    assert merged == "First concern\n\nSecond concern"
+
+
+def test_security_concerns_flatten():
+    merged = _merged(["A finding"], "No")
+
+    assert "A finding" in merged
+    assert "['" not in merged
+
+
+def test_artifact_findings_merge_across_chunks_without_duplicates():
+    def finding(evidence, kind="failure"):
+        return {"kind": kind, "fact": "A job failed.", "evidence": evidence}
+
+    lint, unit, destroy = finding("job lint failed"), finding("job unit failed"), finding("bucket destroyed", "destroy")
+    chunks = [{"review": {"artifact_findings": [lint, unit]}},
+              {"review": {"artifact_findings": [{**unit, "fact": "Reworded.", "evidence": " Job  UNIT failed "},
+                                                destroy]}}]
+    assert merge_review_chunks(chunks)["review"]["artifact_findings"] == [lint, unit, destroy]
+
+
+def test_failure_modes_merge_valid_cases_in_chunk_order_and_cap_at_three():
+    def mode(what):
+        return {"what": what, "where": "app.py:save", "trigger": "Write fails",
+                "detected_by": "Write failure test", "covered_in_this_pr": False}
+
+    first, second, third, fourth = [mode(name) for name in ("First", "Second", "Third", "Fourth")]
+    chunks = [{"review": {"failure_modes": [None, {"what": "bad"}, first, second]}},
+              {"review": {"failure_modes": "invalid"}},
+              {"review": {"failure_modes": [third, fourth]}}]
+    assert merge_review_chunks(chunks)["review"]["failure_modes"] == [first, second, third]
+    assert len(chunks[0]["review"]["failure_modes"]) == 4
+    assert _merged([first], [first], field="failure_modes") == [first, first]
+    assert _merged(None, [], field="failure_modes") == []
+    assert _merged([first] * 4, field="failure_modes") == [first] * 3
+
+
+@pytest.mark.parametrize("first, second", [
+    (["Add retry"], ["Log failures"]),
+    ("- Add retry", ["Log failures"]),
+    (["Add retry"], "- Log failures"),
+])
+def test_ticket_requirement_lists_from_several_chunks_are_unioned(first, second):
+    def chunk(not_met):
+        return {"review": {"ticket_compliance_check": [
+            {"ticket_url": "https://tracker/1", "not_compliant_requirements": not_met}]}}
+
+    [entry] = merge_review_chunks([chunk(first), chunk(second)])["review"]["ticket_compliance_check"]
+
+    assert entry["not_compliant_requirements"] == "- Add retry\n- Log failures"
