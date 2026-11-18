@@ -1,12 +1,26 @@
+import os
+import re
+
+import openai
+from tenacity import retry, retry_if_exception_type, retry_if_not_exception_type, stop_after_attempt
+
+from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
+from pr_agent.algo.run_details import record_ai_call
+from pr_agent.algo.token_budget import _as_int, get_max_input_tokens, get_max_tokens
+from pr_agent.config_loader import get_settings
+from pr_agent.log import get_logger
+
 _LANGCHAIN_INSTALLED = False
 
 try:
     from langchain_core.messages import HumanMessage, SystemMessage
+    from langchain_core.runnables import Runnable
     from langchain_openai import AzureChatOpenAI, ChatOpenAI
     _LANGCHAIN_INSTALLED = True
-except:  # we don't enforce langchain as a dependency, so if it's not installed, just move on
+except ImportError:  # we don't enforce langchain as a dependency, so if it's not installed, just move on
     pass
 
+<<<<<<< HEAD
 import functools
 
 import openai
@@ -18,7 +32,22 @@ from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
 
+=======
+>>>>>>> upstream/main
 OPENAI_RETRIES = 5
+
+
+def _is_native_openai_endpoint(api_base: str | None) -> bool:
+    """Recognize native defaults without overriding LangChain's endpoint selection."""
+    api_base = api_base or os.getenv("OPENAI_API_BASE") or None
+    if api_base is None:
+        # Newer LangChain versions select this gateway before the SDK's own defaults.
+        if os.getenv("LANGSMITH_GATEWAY", "").lower() not in ("", "false", "0", "no"):
+            return False
+        api_base = os.getenv("OPENAI_BASE_URL")
+        if api_base is None:
+            return True
+    return re.fullmatch(r"(?ai:https://api\.openai\.com)(?::443)?/v1/?", api_base) is not None
 
 
 class LangChainOpenAIHandler(BaseAiHandler):
@@ -37,6 +66,21 @@ class LangChainOpenAIHandler(BaseAiHandler):
         Returns the deployment ID for the OpenAI API.
         """
         return get_settings().get("OPENAI.DEPLOYMENT_ID", None)
+
+    def get_model_token_limits(self, model: str, *, ignore_max_model_tokens: bool = False) -> tuple[int, int | None]:
+        """Use this client's route, not LiteLLM's independent provider setting."""
+        provider = "azure" if self.azure else "openai"
+        window = get_max_tokens(
+            model, ignore_max_model_tokens=ignore_max_model_tokens, custom_llm_provider=provider,
+        )
+        input_limit = get_max_input_tokens(model, custom_llm_provider=provider)
+        api_base = get_settings().get("OPENAI.API_BASE", None)
+        custom_limit = _as_int(get_settings().config.custom_model_max_tokens)
+        # A compatible gateway does not establish ownership of the native model's full window.
+        if (not self.azure and input_limit is not None and custom_limit > 0
+                and not _is_native_openai_endpoint(api_base)):
+            window = min(window, custom_limit)
+        return window, input_limit
 
     async def _create_chat_async(self, deployment_id=None):
         try:
@@ -60,19 +104,28 @@ class LangChainOpenAIHandler(BaseAiHandler):
                     )
         except AttributeError as e:
             # Handle configuration errors
-            error_msg = f"OpenAI {e.name} is required" if getattr(e, "name") else str(e)
+            error_msg = f"OpenAI {e.name} is required" if e.name else str(e)
             get_logger().error(error_msg)
             raise ValueError(error_msg) from e
 
     @retry(
-        retry=retry_if_exception_type(openai.APIError) & retry_if_not_exception_type(openai.RateLimitError),
+        retry=retry_if_exception_type(openai.APIError) & retry_if_not_exception_type(
+            (openai.RateLimitError, openai.BadRequestError, openai.UnprocessableEntityError,
+             openai.AuthenticationError, openai.PermissionDeniedError)
+        ),
         stop=stop_after_attempt(OPENAI_RETRIES),
     )
-    async def chat_completion(self, model: str, system: str, user: str, temperature: float = 0.2, img_path: str = None):
+    async def chat_completion(
+            self, model: str, system: str, user: str, temperature: float = 0.2, img_path: str|None = None):
         if img_path:
-            get_logger().warning(f"Image path is not supported for LangChainOpenAIHandler. Ignoring image path: {img_path}")
+            get_logger().warning(
+                f"Image path is not supported for LangChainOpenAIHandler. Ignoring image path: {img_path}")
         try:
-            messages = [SystemMessage(content=system), HumanMessage(content=user)]
+            request_messages = self.build_request_messages(model, system, user)
+            messages = [
+                SystemMessage(content=request_messages[0]["content"]),
+                HumanMessage(content=request_messages[1]["content"]),
+            ]
             llm = await self._create_chat_async(deployment_id=self.deployment_id)
 
             if not isinstance(llm, Runnable):
@@ -98,7 +151,22 @@ class LangChainOpenAIHandler(BaseAiHandler):
                 get_logger().info(f"Using simplified ainvoke for {type(llm)}")
                 resp = await llm.ainvoke(input=messages)
 
-            finish_reason = "completed"
+            metadata = getattr(resp, "response_metadata", None)
+            if isinstance(metadata, dict):
+                reason = (metadata.get("finish_reason") or metadata.get("stop_reason")
+                          or metadata.get("finishReason"))
+            else:
+                reason = None
+            finish_reason = str(reason).lower() if reason else "completed"
+            if finish_reason in ("max_tokens", "max-tokens", "max_tokens_reached", "max_output_tokens"):
+                finish_reason = "length"
+            # Count the call but not its tokens. Langchain reports usage under key names of its
+            # own (input_tokens/output_tokens) rather than the ones the collector reads, so
+            # forwarding it unmapped would render zeros. Mapping them is not worth it while this
+            # path stays cold: langchain is an optional extra (not installed by default) and no setting
+            # selects this handler, so it is reachable only by injecting it into a command
+            # programmatically.
+            record_ai_call()
             return resp.content, finish_reason
 
         except openai.RateLimitError as e:
@@ -109,4 +177,4 @@ class LangChainOpenAIHandler(BaseAiHandler):
             raise
         except Exception as e:
             get_logger().warning(f"Unknown error during LLM inference: {e}")
-            raise openai.APIError from e
+            raise
