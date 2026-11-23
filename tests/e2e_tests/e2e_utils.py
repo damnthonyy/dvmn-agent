@@ -1,12 +1,21 @@
-FILE_PATH = "pr_agent/cli_pip.py"
+FILE_PATH: str = "pr_agent/cli_pip.py"
 
-PR_HEADER_START_WITH = '### **User description**\nupdate cli_pip.py\n\n\n___\n\n### **PR Type**'
-REVIEW_START_WITH = '## PR Reviewer Guide 🔍\n\n<table>\n<tr><td>⏱️&nbsp;<strong>Estimated effort to review</strong>:'
-IMPROVE_START_WITH_REGEX_PATTERN = r'^## PR Code Suggestions ✨\n\n<!-- [a-z0-9]+ -->\n\n<table><thead><tr><td>Category</td>'
+PR_HEADER_START_WITH = (
+    "### **User description**\nupdate cli_pip.py\n\n\n___\n\n### **PR Type**"
+)
+REVIEW_START_WITH = (
+    "## PR Reviewer Guide 🔍\n\n<!-- pr-agent:review:full -->\n\n"
+    "<table>\n<tr><td>⏱️&nbsp;<strong>Estimated effort to review</strong>:"
+)
+IMPROVE_START_WITH_REGEX_PATTERN = (
+    r"^## PR Code Suggestions ✨\n\n"
+    r"<!-- pr-agent:improve:summary -->\n\n"
+    r"<!-- [a-z0-9]+ -->\n\n<table><thead><tr><td>Category</td>"
+)
 
-NUM_MINUTES = 5
+NUM_MINUTES: int = 5
 
-NEW_FILE_CONTENT = """\
+NEW_FILE_CONTENT: str = """\
 from pr_agent import cli
 from pr_agent.config_loader import get_settings
 
@@ -16,8 +25,14 @@ def main():
     provider = "github"  # GitHub provider
     user_token = "..."  # GitHub user token
     openai_key = "ghs_afsdfasdfsdf"  # Example OpenAI key
+<<<<<<< HEAD
     pr_url = "..."  # PR URL, for example 'https://github.com/Codium-ai/dvmn-agent/pull/809'
     command = "/improve"  # Command to run (e.g. '/review', '/describe', 'improve', '/ask="What is the purpose of this PR?"')
+=======
+    pr_url = "..."  # PR URL, for example 'https://github.com/Codium-ai/pr-agent/pull/809'
+    command = "/improve"  # Command to run (e.g. '/review', '/describe', 'improve',
+    # '/ask="What is the purpose of this PR?"')
+>>>>>>> upstream/main
 
     # Setting the configurations
     get_settings().set("CONFIG.git_provider", provider)
