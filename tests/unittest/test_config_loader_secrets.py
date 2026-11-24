@@ -30,7 +30,7 @@ class TestConfigLoaderSecrets:
             mock_get_provider.return_value = None
 
             # Confirm no exception is raised
-            apply_secrets_manager_config()
+            assert apply_secrets_manager_config() is None
 
     def test_apply_secrets_manager_config_not_aws(self):
         with patch('pr_agent.secret_providers.get_secret_provider') as mock_get_provider, \
@@ -117,4 +117,8 @@ class TestConfigLoaderSecrets:
             mock_get_provider.side_effect = Exception("Provider error")
 
             # Confirm processing continues even when exception occurs
+<<<<<<< HEAD
             apply_secrets_manager_config()  # Confirm no exception is raised
+=======
+            assert apply_secrets_manager_config() is None# Confirm no exception is raised
+>>>>>>> upstream/main

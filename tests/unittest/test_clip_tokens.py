@@ -1,9 +1,10 @@
+import doctest
 from unittest.mock import MagicMock, patch
 
-import pytest
+from tiktoken import get_encoding
 
+from pr_agent.algo.token_budget import clip_tokens
 from pr_agent.algo.token_handler import TokenEncoder
-from pr_agent.algo.utils import clip_tokens
 
 
 class TestClipTokens:
@@ -62,19 +63,23 @@ class TestClipTokens:
             assert len(result) < len(text)
 
     def test_negative_max_tokens(self):
-        """Test that negative max_tokens returns empty string."""
+        """Test that negative max_tokens returns empty string without tokenizing."""
         text = "Some text"
-        result = clip_tokens(text, -1)
-        assert result == ""
+        with patch.object(TokenEncoder, 'get_token_encoder') as mock_encoder:
+            mock_encoder.side_effect = AssertionError('tokenizer should not be called')
 
-        result = clip_tokens(text, -100)
-        assert result == ""
+            assert clip_tokens(text, -1) == ""
+            assert clip_tokens(text, -100) == ""
+            mock_encoder.assert_not_called()
 
     def test_zero_max_tokens(self):
-        """Test that zero max_tokens returns empty string."""
+        """Test that zero max_tokens returns empty string without tokenizing."""
         text = "Some text"
-        result = clip_tokens(text, 0)
-        assert result == ""
+        with patch.object(TokenEncoder, 'get_token_encoder') as mock_encoder:
+            mock_encoder.side_effect = AssertionError('tokenizer should not be called')
+
+            assert clip_tokens(text, 0) == ""
+            mock_encoder.assert_not_called()
 
     def test_delete_last_line_functionality(self):
         """Test the delete_last_line parameter functionality."""
@@ -260,7 +265,7 @@ class TestClipTokens:
         max_tokens = 10
 
         # Patch the logger at the module level where it's imported
-        with patch('pr_agent.algo.utils.get_logger') as mock_logger:
+        with patch('pr_agent.algo.token_budget.get_logger') as mock_logger:
             mock_log_instance = MagicMock()
             mock_logger.return_value = mock_log_instance
 
@@ -308,3 +313,17 @@ class TestClipTokens:
         result = clip_tokens(text, max_tokens)
         expected_results = 'line1\nline2\nline3\n\n...(truncated)'
         assert result == expected_results
+<<<<<<< HEAD
+=======
+
+    def test_docstring_examples_match_actual_output(self):
+        """The examples in the clip_tokens docstring are what the function returns."""
+        runner = doctest.DocTestRunner()
+        # Pin the tokenizer the default model resolves to, so the examples don't depend on the configured model.
+        with patch.object(TokenEncoder, 'get_token_encoder', return_value=get_encoding("o200k_base")):
+            for test in doctest.DocTestFinder().find(clip_tokens, globs={"clip_tokens": clip_tokens}):
+                runner.run(test)
+        results = runner.summarize(verbose=False)
+        assert results.attempted > 0
+        assert results.failed == 0
+>>>>>>> upstream/main
